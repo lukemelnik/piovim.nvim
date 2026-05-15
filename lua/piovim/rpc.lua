@@ -10,6 +10,7 @@ local state = {
   next_id = 1,
   stdout_pending = "",
   streaming = false,
+  abort_sent = false,
   status_mode = "idle",
   tool_name = nil,
   model_name = nil,
@@ -207,12 +208,14 @@ local function handle_event(msg)
 
   if msg.type == "agent_start" then
     state.streaming = true
+    state.abort_sent = false
     set_status_mode("streaming")
     return
   end
 
   if msg.type == "agent_end" then
     state.streaming = false
+    state.abort_sent = false
     set_status_mode("idle")
     Panel.assistant_end()
     return
@@ -309,6 +312,7 @@ function M.start(opts)
   state.model_name = nil
   state.thinking_level = nil
   state.streaming = false
+  state.abort_sent = false
   set_status_mode("idle")
   local saved = Store.get()
   local cmd = {
@@ -370,6 +374,7 @@ function M.start(opts)
       vim.schedule(function()
         state.job = nil
         state.streaming = false
+        state.abort_sent = false
         set_status_mode("idle")
         Panel.system("Pi process exited (" .. tostring(code) .. ")")
       end)
@@ -396,6 +401,7 @@ function M.stop()
   local job = state.job
   state.job = nil
   state.streaming = false
+  state.abort_sent = false
   set_status_mode("idle")
   vim.fn.jobstop(job)
   Panel.system("Pi stopped")
@@ -426,6 +432,7 @@ function M.prompt(message)
     command.streamingBehavior = "followUp"
   end
 
+  state.abort_sent = false
   return M.send(command)
 end
 
@@ -497,12 +504,19 @@ function M.select_model()
 end
 
 function M.abort()
-  if state.job then
-    M.send({ type = "abort" })
-    state.streaming = false
-    set_status_mode("idle")
-    Panel.cancelled()
+  if not state.job or not state.streaming or state.abort_sent then
+    return false
   end
+
+  if not M.send({ type = "abort" }) then
+    return false
+  end
+
+  state.abort_sent = true
+  state.streaming = false
+  set_status_mode("idle")
+  Panel.cancelled()
+  return true
 end
 
 return M
