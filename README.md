@@ -185,8 +185,9 @@ Model/thinking settings are persisted at:
 Run local checks:
 
 ```sh
-luac -p lua/piovim/*.lua
+luac -p lua/piovim/*.lua scripts/smoke.lua
 nvim --headless -u NONE --cmd 'set rtp^=/path/to/piovim.nvim' -c 'lua require("piovim").setup({ keys = {} })' -c 'qa'
+nvim --headless -u NONE --cmd 'set rtp^=/path/to/piovim.nvim' -S scripts/smoke.lua -c 'qa'
 ```
 
 ## Release flow
