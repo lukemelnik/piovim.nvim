@@ -20,7 +20,15 @@ local config = {
     model_select = "<leader>pm",
     model_cycle = "<leader>pM",
   },
+  dev = {
+    self_fix = false,
+  },
 }
+
+local function plugin_root()
+  local source = debug.getinfo(1, "S").source:sub(2)
+  return vim.fn.fnamemodify(source, ":p:h:h:h")
+end
 
 local function valid_buf(buf)
   return buf and vim.api.nvim_buf_is_valid(buf)
@@ -238,6 +246,37 @@ function M.append_context()
   Panel.append_prompt_text(mention .. "\n")
 end
 
+local function self_fix_enabled()
+  return config.dev and config.dev.self_fix == true
+end
+
+function M.append_self_fix_context()
+  if not self_fix_enabled() then
+    vim.notify("Piovim self-fix mode is not enabled", vim.log.levels.WARN)
+    return
+  end
+
+  local root = plugin_root()
+  local context = table.concat({
+    "Fix piovim.nvim itself.",
+    "",
+    "Repo: " .. root,
+    "Use normal Pi file tools for plugin source changes unless editing an already-open live buffer is specifically needed.",
+    "Do not edit my Neovim config unless I explicitly ask.",
+    "Keep changes scoped to piovim.nvim.",
+    "After changes, run:",
+    "- luac -p lua/piovim/*.lua",
+    "- nvim --headless -u NONE --cmd 'set rtp^=" .. root .. "' -c 'lua require(\"piovim\").setup({ keys = {} })' -c 'qa'",
+    "",
+    "My fix request:",
+    "",
+  }, "\n")
+
+  Panel.open({ width = config.side_width, focus_prompt = true })
+  ensure_started()
+  Panel.append_prompt_text(context)
+end
+
 function M.toggle()
   Panel.toggle({ width = config.side_width, focus_prompt = true })
   if Panel.is_open() then
@@ -350,6 +389,7 @@ local function setup_commands()
   vim.api.nvim_create_user_command("PiovimClear", M.clear, { desc = "Clear Piovim session" })
   vim.api.nvim_create_user_command("PiovimClearHighlights", M.clear_highlights, { desc = "Clear Pi code highlights" })
   vim.api.nvim_create_user_command("PiovimAppendContext", M.append_context, { desc = "Append current Pi context mention" })
+  vim.api.nvim_create_user_command("PiovimSelfFix", M.append_self_fix_context, { desc = "Append Piovim self-fix context" })
   vim.api.nvim_create_user_command("PiovimAbort", M.abort, { desc = "Abort current Pi turn" })
   vim.api.nvim_create_user_command("PiovimThinkingCycle", M.cycle_thinking_level, { desc = "Cycle Pi thinking level" })
   vim.api.nvim_create_user_command("PiovimThinkingSelect", M.select_thinking_level, { desc = "Select Pi thinking level" })
@@ -402,6 +442,10 @@ local function handle_prompt_submit(text)
   end
   if text == "/thinking" then
     M.select_thinking_level()
+    return
+  end
+  if text == "/pi-fix" then
+    M.append_self_fix_context()
     return
   end
   M.ask(text)
