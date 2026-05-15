@@ -182,6 +182,17 @@ Model/thinking settings are persisted at:
 
 ## Development
 
+Code layout:
+
+- `lua/piovim/init.lua` wires setup, commands, keymaps, and user actions.
+- `lua/piovim/context.lua` builds prompt context and plain `@buffer` / `@selection` mentions.
+- `lua/piovim/panel.lua` owns the side-panel UI and prompt buffer.
+- `lua/piovim/rpc.lua` starts Pi RPC mode and renders Pi events into the panel.
+- `lua/piovim/bridge.lua` owns the local TCP bridge between Pi and Neovim.
+- `lua/piovim/buffer_ops.lua` implements Neovim buffer tools.
+- `lua/piovim/edit_preview.lua` renders in-place edit previews.
+- `pi-extension/nvim-tools.ts` registers Pi-side `nvim_*` tools.
+
 Run local checks:
 
 ```sh

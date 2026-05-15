@@ -104,7 +104,7 @@ local function confirm(anchor)
 end
 
 function M.show(buf, previews)
-  if #vim.api.nvim_list_uis() == 0 then
+  if vim.g.piovim_auto_accept_edits == true or #vim.api.nvim_list_uis() == 0 then
     return true
   end
 

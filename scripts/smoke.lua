@@ -4,6 +4,8 @@ local function assert_true(value, message)
   end
 end
 
+vim.g.piovim_auto_accept_edits = true
+
 local piovim = require("piovim")
 piovim.setup({ keys = {}, dev = { self_fix = true } })
 
@@ -33,6 +35,27 @@ local mention = context.mention(nil)
 assert_true(mention:find("@buffer", 1, true) ~= nil, "buffer mention missing")
 assert_true(mention:find(":1", 1, true) ~= nil, "buffer mention missing cursor line")
 
+local buffer_ops = require("piovim.buffer_ops")
+local empty = vim.fn.tempname() .. ".ts"
+vim.fn.writefile({}, empty)
+vim.cmd.edit(vim.fn.fnameescape(empty))
+local read = buffer_ops.read_buffer({})
+buffer_ops.edit_buffer({
+  expected_changedtick = read.buffer.changedtick,
+  rangeEdits = {
+    {
+      startLine = 1,
+      startCol = 0,
+      endLine = 1,
+      endCol = 0,
+      newText = "const value = 1;\n",
+    },
+  },
+})
+local edited_lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+assert_true(edited_lines[1] == "const value = 1;", "range edit did not update empty buffer")
+
 panel.close()
-vim.cmd("bdelete!")
+vim.cmd("%bdelete!")
 vim.fn.delete(tmp)
+vim.fn.delete(empty)
