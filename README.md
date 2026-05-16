@@ -95,7 +95,7 @@ Typed in the Piovim prompt:
 - `/thinking` opens thinking-level selection.
 - `/diff` opens the Pi review-source picker.
 - `/diff <args>` opens a Pi review diff with custom `git diff` args, e.g. `/diff main...HEAD`.
-- `/apply-fixes` asks Pi to fix active review notes and resolve them as it goes.
+- `/apply` asks Pi to fix active review notes and resolve them as it goes.
 
 In the Pi prompt buffer, type a slash prefix and press `<Tab>` to complete slash commands. Multiple matches open a picker.
 
@@ -130,6 +130,8 @@ Mentions are intentionally plain text. Piovim does not paste selected code into 
 - custom `git diff` args
 
 While a review is open, Piovim watches the active review source and refreshes when Git or patch-file contents change. Refreshes are deferred while you are typing or editing a review note so annotations are not interrupted.
+
+Large files are guarded during rendering: files over 5,000 rendered lines are marked as large, and sides over 20,000 rendered lines are omitted with a placeholder instead of filling Neovim with huge buffers.
 
 Inside the diff view:
 
@@ -261,9 +263,10 @@ Code layout:
 Run local checks:
 
 ```sh
-luac -p lua/piovim/*.lua scripts/smoke.lua
+luac -p lua/piovim/*.lua scripts/smoke.lua scripts/review_diff_tests.lua
 nvim --headless -u NONE --cmd 'set rtp^=/path/to/piovim.nvim' -c 'lua require("piovim").setup({ keys = {} })' -c 'qa'
 nvim --headless -u NONE --cmd 'set rtp^=/path/to/piovim.nvim' -S scripts/smoke.lua -c 'qa'
+nvim --headless -u NONE --cmd 'set rtp^=/path/to/piovim.nvim' -S scripts/review_diff_tests.lua -c 'qa'
 ```
 
 ## Release flow

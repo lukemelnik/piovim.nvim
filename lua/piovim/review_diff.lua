@@ -26,6 +26,8 @@ local state = {
 
 local ns = vim.api.nvim_create_namespace("piovim-review-diff")
 local state_version = 1
+local large_line_threshold = 5000
+local omit_line_threshold = 20000
 
 local function valid_buf(buf)
   return buf and vim.api.nvim_buf_is_valid(buf)
@@ -289,6 +291,13 @@ local function new_file(path)
     hunks = {},
     patch_old_lines = nil,
     patch_new_lines = nil,
+    metadata = {},
+    binary = false,
+    renamed = false,
+    mode_only = false,
+    large = false,
+    omitted = false,
+    omitted_reason = nil,
   }
 end
 
@@ -344,11 +353,12 @@ local function parse_diff(text)
   local pending_old_path = nil
 
   for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
-    local path = line:match("^diff %-%-git a/(.-) b/")
+    local old_diff_path, new_diff_path = line:match("^diff %-%-git a/(.-) b/(.+)")
     local plain_old_path = line:match("^%-%-%- (.+)")
     local plain_new_path = line:match("^%+%+%+ (.+)")
-    if path then
-      file = new_file(path)
+    if old_diff_path then
+      file = new_file(new_diff_path)
+      file.old_path = old_diff_path
       file.patch_old_lines = {}
       file.patch_new_lines = {}
       in_hunk = false
@@ -382,6 +392,35 @@ local function parse_diff(text)
         end
       end
 
+      local rename_from = line:match("^rename from (.+)")
+      local rename_to = line:match("^rename to (.+)")
+      if rename_from then
+        file.old_path = rename_from
+        file.renamed = true
+      elseif rename_to then
+        file.path = rename_to
+        file.renamed = true
+      elseif line:match("^Binary files .+ differ") or line:match("^GIT binary patch") then
+        file.binary = true
+      elseif line:match("^old mode ") or line:match("^new mode ") then
+        file.mode_only = true
+      end
+
+      if line:match("^old mode ")
+        or line:match("^new mode ")
+        or line:match("^new file mode ")
+        or line:match("^deleted file mode ")
+        or line:match("^similarity index ")
+        or line:match("^dissimilarity index ")
+        or line:match("^rename from ")
+        or line:match("^rename to ")
+        or line:match("^copy from ")
+        or line:match("^copy to ")
+        or line:match("^Binary files .+ differ")
+        or line:match("^GIT binary patch") then
+        table.insert(file.metadata, line)
+      end
+
       local hunk = parse_hunk_header(line)
       if hunk then
         table.insert(file.hunks, hunk)
@@ -390,16 +429,31 @@ local function parse_diff(text)
         local marker = line:sub(1, 1)
         local body = line:sub(2)
         if marker == " " then
-          table.insert(file.patch_old_lines, body)
-          table.insert(file.patch_new_lines, body)
+          if #file.patch_old_lines < omit_line_threshold then
+            table.insert(file.patch_old_lines, body)
+          end
+          if #file.patch_new_lines < omit_line_threshold then
+            table.insert(file.patch_new_lines, body)
+          end
         elseif marker == "-" then
-          table.insert(file.patch_old_lines, body)
+          if #file.patch_old_lines < omit_line_threshold then
+            table.insert(file.patch_old_lines, body)
+          end
         elseif marker == "+" then
-          table.insert(file.patch_new_lines, body)
+          if #file.patch_new_lines < omit_line_threshold then
+            table.insert(file.patch_new_lines, body)
+          end
         elseif line:match("^\\ No newline") then
           -- metadata line; ignore
         elseif line:match("^diff %-%-git ") then
           in_hunk = false
+        end
+        if #file.patch_old_lines >= omit_line_threshold or #file.patch_new_lines >= omit_line_threshold then
+          file.omitted = true
+          file.large = true
+          file.omitted_reason = "patch exceeds " .. tostring(omit_line_threshold) .. " rendered lines"
+        elseif #file.patch_old_lines >= large_line_threshold or #file.patch_new_lines >= large_line_threshold then
+          file.large = true
         end
       end
     end
@@ -413,10 +467,16 @@ local function current_file()
 end
 
 local function file_status(file)
-  if file.old_null then
+  if file.binary then
+    return "B"
+  elseif file.renamed then
+    return "R"
+  elseif file.old_null then
     return "A"
   elseif file.new_null then
     return "D"
+  elseif file.mode_only and #file.hunks == 0 then
+    return "T"
   end
   return "M"
 end
@@ -625,10 +685,56 @@ local function read_worktree_file(root, path)
   return vim.fn.readfile(full_path)
 end
 
+local function metadata_lines(file, side)
+  local lines = {}
+  local status = file_status(file)
+  table.insert(lines, "metadata-only change: " .. status)
+  if file.renamed then
+    table.insert(lines, (side == "old" and "from: " or "to: ") .. (side == "old" and file.old_path or file.path))
+  else
+    table.insert(lines, file.path)
+  end
+  for _, line in ipairs(file.metadata or {}) do
+    table.insert(lines, line)
+  end
+  return lines
+end
+
+local function omitted_lines(file, side, line_count)
+  file.omitted = true
+  file.large = true
+  file.omitted_reason = file.omitted_reason or ("file side has " .. tostring(line_count) .. " lines")
+  return {
+    "Large file omitted from Pi review rendering",
+    "file: " .. file.path,
+    "side: " .. side,
+    "lines: " .. tostring(line_count),
+    "threshold: " .. tostring(omit_line_threshold),
+    "Open the source file directly or narrow the review source to inspect this file.",
+  }
+end
+
+local function apply_large_safeguard(file, side, lines)
+  local count = #lines
+  if count >= omit_line_threshold then
+    return omitted_lines(file, side, count)
+  end
+  if count >= large_line_threshold then
+    file.large = true
+  end
+  return lines
+end
+
 side_lines = function(file, side)
   local comparison = state.comparison or {}
+  if file.binary then
+    return metadata_lines(file, side)
+  end
+  if #file.hunks == 0 and file.metadata and #file.metadata > 0 then
+    return metadata_lines(file, side)
+  end
   if comparison.kind == "patch" then
-    return side == "old" and (file.patch_old_lines or {}) or (file.patch_new_lines or {})
+    return apply_large_safeguard(file, side, side == "old" and (file.patch_old_lines or {}) or (file.patch_new_lines or {}))
   end
 
   if side == "old" then
@@ -637,28 +743,28 @@ side_lines = function(file, side)
     end
     local lines = read_git_file(state.root, comparison.old_source, file.old_path)
     if #lines > 0 then
-      return lines
+      return apply_large_safeguard(file, side, lines)
     end
-    return file.patch_old_lines or {}
+    return apply_large_safeguard(file, side, file.patch_old_lines or {})
   end
 
   if file.new_null then
     return {}
   end
   if comparison.new_source == "index" then
-    return read_index_file(state.root, file.path)
+    return apply_large_safeguard(file, side, read_index_file(state.root, file.path))
   elseif comparison.new_source == "HEAD" then
-    return read_git_file(state.root, "HEAD", file.path)
+    return apply_large_safeguard(file, side, read_git_file(state.root, "HEAD", file.path))
   elseif comparison.new_source and comparison.new_source ~= "worktree" and comparison.new_source ~= "patch" then
     local lines = read_git_file(state.root, comparison.new_source, file.path)
     if #lines > 0 then
-      return lines
+      return apply_large_safeguard(file, side, lines)
     end
   end
   if comparison.new_source == "patch" then
-    return file.patch_new_lines or {}
+    return apply_large_safeguard(file, side, file.patch_new_lines or {})
   end
-  return read_worktree_file(state.root, file.path)
+  return apply_large_safeguard(file, side, read_worktree_file(state.root, file.path))
 end
 
 local function clear_diff_windows()
@@ -687,7 +793,8 @@ local function render_list()
       end
     end
     local suffix = note_count > 0 and ("  (" .. note_count .. ")") or ""
-    table.insert(lines, prefix .. icon .. " " .. file.path .. "  " .. file_status(file) .. suffix)
+    local badge = file.omitted and " !" or (file.large and " ~" or "")
+    table.insert(lines, prefix .. icon .. " " .. file.path .. "  " .. file_status(file) .. badge .. suffix)
   end
   if #state.files == 0 then
     table.insert(lines, "No changes")
@@ -1164,9 +1271,10 @@ local function pick_file()
   for index, file in ipairs(state.files) do
     local note_count = note_count_for_file(file.path)
     local suffix = note_count > 0 and ("  (" .. note_count .. ")") or ""
+    local badge = file.omitted and " !" or (file.large and " ~" or "")
     table.insert(choices, {
       index = index,
-      label = file.path .. "  " .. file_status(file) .. suffix,
+      label = file.path .. "  " .. file_status(file) .. badge .. suffix,
     })
   end
   if #choices == 0 then
@@ -1658,7 +1766,7 @@ function M.summary()
     "- Read the active review diff and annotations.",
     "- Fix each annotation with minimal code changes.",
     "- Prefer nvim_edit_buffer for files open in Neovim so the review diff refreshes live.",
-    "- Save edited buffers when the user explicitly asked for apply-fixes from the review flow.",
+    "- Save edited buffers when the user explicitly asked for /apply from the review flow.",
     "- After fixing a note, call nvim_resolve_review_annotation with its id.",
     "- Refresh/check the diff when done and report any unresolved notes.",
     "",
@@ -1693,7 +1801,17 @@ function M.get_context()
     root = state.root,
     comparison = state.comparison and state.comparison.label or nil,
     source = state.source and { kind = state.source.kind, label = state.source.label, input = state.source.input } or nil,
-    files = vim.tbl_map(function(item) return item.path end, state.files),
+    files = vim.tbl_map(function(item)
+      return {
+        path = item.path,
+        old_path = item.old_path,
+        status = file_status(item),
+        hunks = #item.hunks,
+        large = item.large == true,
+        omitted = item.omitted == true,
+        omitted_reason = item.omitted_reason,
+      }
+    end, state.files),
     current_file = file and file.path or nil,
     current_range = range,
     current_hunk = current_hunk,
@@ -1753,6 +1871,18 @@ local function setup_autocmds()
     end,
   })
 end
+
+M._test = {
+  parse_diff = parse_diff,
+  file_status = file_status,
+  source_from = source_from,
+  commit_source = commit_source,
+  range_source = range_source,
+  patch_source = patch_source,
+  apply_large_safeguard = apply_large_safeguard,
+  large_line_threshold = large_line_threshold,
+  omit_line_threshold = omit_line_threshold,
+}
 
 function M.setup_commands()
   setup_autocmds()

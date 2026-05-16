@@ -179,7 +179,7 @@ function M.apply_review_fixes()
     return
   end
   local message = ReviewDiff.summary()
-  Panel.user_message("/apply-fixes", "Active review diff notes")
+  Panel.user_message("/apply", "Active review diff notes")
   Rpc.prompt(message)
 end
 
@@ -192,7 +192,7 @@ local function register_slash_commands()
     { name = "/thinking", description = "Select thinking level", handler = M.select_thinking_level },
     { name = "/pi-fix", description = "Append Piovim self-fix context", handler = M.append_self_fix_context },
     { name = "/diff", description = "Open review diff picker", handler = ReviewDiff.pick, accepts_args = true },
-    { name = "/apply-fixes", description = "Ask Pi to apply active review notes", handler = M.apply_review_fixes },
+    { name = "/apply", description = "Ask Pi to apply active review notes", handler = M.apply_review_fixes },
   }
   Panel.set_slash_commands(slash_commands)
 end
