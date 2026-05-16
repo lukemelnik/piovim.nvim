@@ -1,3 +1,5 @@
+local PluginBuffer = require("piovim.plugin_buffer")
+
 local M = {}
 
 local state = {
@@ -28,6 +30,8 @@ local ns = vim.api.nvim_create_namespace("piovim-review-diff")
 local state_version = 1
 local large_line_threshold = 5000
 local omit_line_threshold = 20000
+local max_untracked_file_bytes = 512 * 1024
+local default_base_override = nil
 
 local function valid_buf(buf)
   return buf and vim.api.nvim_buf_is_valid(buf)
@@ -38,9 +42,7 @@ local function valid_win(win)
 end
 
 local function is_piovim_buf(buf)
-  local ft = vim.bo[buf].filetype
-  local name = vim.api.nvim_buf_get_name(buf)
-  return ft:match("^piovim%-") ~= nil or name:match("Pi Review") ~= nil
+  return PluginBuffer.is_plugin_buffer(buf)
 end
 
 local function source_win()
@@ -106,6 +108,9 @@ local function save_state()
 end
 
 local function load_state(root)
+  state.annotations = {}
+  state.next_annotation_id = 1
+
   local path = state_path(root)
   if vim.fn.filereadable(path) ~= 1 then
     return
@@ -146,8 +151,43 @@ end
 
 local function split_args(text)
   local args = {}
-  for arg in string.gmatch(text or "", "%S+") do
-    table.insert(args, arg)
+  local current = {}
+  local quote = nil
+  local escaped = false
+
+  for index = 1, #(text or "") do
+    local char = text:sub(index, index)
+    if escaped then
+      table.insert(current, char)
+      escaped = false
+    elseif char == "\\" then
+      escaped = true
+    elseif quote then
+      if char == quote then
+        quote = nil
+      else
+        table.insert(current, char)
+      end
+    elseif char == "'" or char == '"' then
+      quote = char
+    elseif char:match("%s") then
+      if #current > 0 then
+        table.insert(args, table.concat(current))
+        current = {}
+      end
+    else
+      table.insert(current, char)
+    end
+  end
+
+  if escaped then
+    table.insert(current, "\\")
+  end
+  if quote then
+    error("Unclosed quote in git diff args")
+  end
+  if #current > 0 then
+    table.insert(args, table.concat(current))
   end
   return args
 end
@@ -165,6 +205,9 @@ local function tracked_input(opts, callback)
 end
 
 local function default_base_ref(root)
+  if default_base_override and git_ref_exists(root, default_base_override) then
+    return default_base_override
+  end
   if git_ref_exists(root, "origin/main") then
     return "origin/main"
   elseif git_ref_exists(root, "main") then
@@ -185,8 +228,14 @@ local function git_rev_parse(root, rev)
   return vim.trim(result.stdout or "")
 end
 
+local pr_source
+
 local function source_from(input, root)
   input = vim.trim(input or "")
+  local pr_number = input:match("^pr%s+(%S+)$")
+  if pr_number or input == "pr" then
+    return pr_source(pr_number or "")
+  end
   if input == "" or input == "working" or input == "worktree" or input == "working-tree" then
     return {
       kind = "working-tree",
@@ -212,11 +261,11 @@ local function source_from(input, root)
     }
   end
 
-  if input == "main" or input == "origin" or input == "origin/main" or input == "pr" or input == "branch" then
+  if input == "main" or input == "origin" or input == "origin/main" or input == "branch" then
     local ref = input == "origin" and "origin/main" or input
     if input == "main" and not git_ref_exists(root, "main") and git_ref_exists(root, "origin/main") then
       ref = "origin/main"
-    elseif input == "pr" or input == "branch" then
+    elseif input == "branch" then
       ref = default_base_ref(root)
     end
     return {
@@ -282,6 +331,18 @@ local function patch_source(path)
   }
 end
 
+pr_source = function(number)
+  number = vim.trim(number or "")
+  return {
+    kind = "pr",
+    label = number == "" and "current branch PR" or ("PR #" .. number),
+    input = number,
+    old_source = "PR base",
+    new_source = "PR head",
+    watch = false,
+  }
+end
+
 local function new_file(path)
   return {
     path = path,
@@ -321,7 +382,8 @@ local function untracked_diff(root)
 
   for _, path in ipairs(vim.split(output, "\n", { plain = true, trimempty = true })) do
     local full_path = root .. "/" .. path
-    if vim.fn.filereadable(full_path) == 1 then
+    local stat = vim.uv.fs_stat(full_path)
+    if vim.fn.filereadable(full_path) == 1 and stat and stat.size <= max_untracked_file_bytes then
       local lines = vim.fn.readfile(full_path)
       table.insert(chunks, "diff --git a/" .. path .. " b/" .. path)
       table.insert(chunks, "new file mode 100644")
@@ -332,6 +394,17 @@ local function untracked_diff(root)
       for _, line in ipairs(lines) do
         table.insert(chunks, "+" .. line)
       end
+    elseif stat and stat.size > max_untracked_file_bytes then
+      table.insert(chunks, "diff --git a/" .. path .. " b/" .. path)
+      table.insert(chunks, "new file mode 100644")
+      table.insert(chunks, "--- /dev/null")
+      table.insert(chunks, "+++ b/" .. path)
+      table.insert(chunks, "@@ -0,0 +1,5 @@")
+      table.insert(chunks, "+Large untracked file omitted from Pi review rendering")
+      table.insert(chunks, "+file: " .. path)
+      table.insert(chunks, "+bytes: " .. tostring(stat.size))
+      table.insert(chunks, "+threshold: " .. tostring(max_untracked_file_bytes))
+      table.insert(chunks, "+Open the source file directly or narrow the review source to inspect this file.")
     end
   end
 
@@ -591,6 +664,7 @@ local function reanchor_annotations_for_file(file)
 
   local lines = side_lines(file, "new")
   local moved = {}
+  local keys_to_clear = {}
   for key, notes in pairs(state.annotations) do
     if key:sub(1, #file.path + 1) == file.path .. ":" then
       for _, note in ipairs(notes) do
@@ -599,8 +673,11 @@ local function reanchor_annotations_for_file(file)
         moved[new_key] = moved[new_key] or {}
         table.insert(moved[new_key], note)
       end
-      state.annotations[key] = nil
+      table.insert(keys_to_clear, key)
     end
+  end
+  for _, key in ipairs(keys_to_clear) do
+    state.annotations[key] = nil
   end
   for key, notes in pairs(moved) do
     state.annotations[key] = state.annotations[key] or {}
@@ -768,12 +845,16 @@ side_lines = function(file, side)
 end
 
 local function clear_diff_windows()
+  local current_win = vim.api.nvim_get_current_win()
   for _, win in ipairs({ state.old_win, state.new_win }) do
     if valid_win(win) then
       pcall(vim.api.nvim_set_current_win, win)
       pcall(vim.cmd, "diffoff")
       pcall(vim.wo, win, "foldenable", false)
     end
+  end
+  if valid_win(current_win) then
+    pcall(vim.api.nvim_set_current_win, current_win)
   end
 end
 
@@ -976,6 +1057,7 @@ function M.resize_if_open()
 end
 
 local function render_file()
+  local restore_win = vim.api.nvim_get_current_win()
   local file = current_file()
   if not file or not valid_buf(state.old_buf) or not valid_buf(state.new_buf) then
     if valid_buf(state.old_buf) then
@@ -1019,6 +1101,9 @@ local function render_file()
   end
 
   render_annotations()
+  if valid_win(restore_win) then
+    pcall(vim.api.nvim_set_current_win, restore_win)
+  end
 end
 
 local function select_file(index)
@@ -1489,6 +1574,17 @@ local function source_diff(source, root)
     return table.concat(vim.fn.readfile(vim.fn.fnamemodify(source.path, ":p")), "\n")
   end
 
+  if source.kind == "pr" then
+    if vim.fn.executable("gh") ~= 1 then
+      error("gh CLI is required to review PRs")
+    end
+    local args = { "gh", "pr", "diff" }
+    if source.input and source.input ~= "" then
+      table.insert(args, source.input)
+    end
+    return system(args, { cwd = root })
+  end
+
   local diff = git_output(source.args, root)
   if source.include_untracked then
     local extra = untracked_diff(root)
@@ -1499,6 +1595,18 @@ local function source_diff(source, root)
   return diff
 end
 
+local function worktree_signature(root)
+  local parts = { git_output({ "status", "--porcelain=v1", "-z", "--untracked-files=all" }, root) }
+  local files = git_output({ "ls-files", "-m", "-o", "--exclude-standard", "-z" }, root)
+  for _, path in ipairs(vim.split(files, "\0", { plain = true, trimempty = true })) do
+    local stat = vim.uv.fs_stat(root .. "/" .. path)
+    if stat then
+      table.insert(parts, path .. ":" .. tostring(stat.mtime.sec) .. ":" .. tostring(stat.mtime.nsec) .. ":" .. tostring(stat.size))
+    end
+  end
+  return table.concat(parts, "\0")
+end
+
 local function source_signature(source, root)
   if not source or not source.watch then
     return nil
@@ -1506,10 +1614,14 @@ local function source_signature(source, root)
   if source.kind == "patch" then
     local stat = source.path and vim.uv.fs_stat(vim.fn.fnamemodify(source.path, ":p"))
     return stat and (tostring(stat.mtime.sec) .. ":" .. tostring(stat.size)) or "missing"
-  elseif source.kind == "working-tree" or source.kind == "staged" then
-    return source_diff(source, root)
+  elseif source.kind == "working-tree" then
+    return worktree_signature(root)
+  elseif source.kind == "staged" then
+    return git_output({ "diff", "--cached", "--raw" }, root)
   elseif source.kind == "commit" then
     return git_output({ "rev-parse", source.input }, root)
+  elseif source.kind == "range" or source.kind == "branch" then
+    return git_output({ "rev-parse", source.old_source or "HEAD" }, root) .. ":" .. git_output({ "rev-parse", source.new_source or "HEAD" }, root)
   end
   return source_diff(source, root)
 end
@@ -1571,9 +1683,20 @@ function M.open_source(source)
   start_watch()
 end
 
+local function open_with_notice(label, callback)
+  local ok, err = pcall(callback)
+  if not ok then
+    vim.notify("Pi review " .. label .. " failed: " .. tostring(err), vim.log.levels.WARN)
+    return false
+  end
+  return true
+end
+
 function M.open(input)
-  state.root = git_root()
-  M.open_source(source_from(input or "", state.root))
+  return open_with_notice("diff", function()
+    state.root = git_root()
+    M.open_source(source_from(input or "", state.root))
+  end)
 end
 
 function M.close()
@@ -1648,18 +1771,31 @@ function M.refresh_if_open(path)
 end
 
 function M.open_commit(rev)
-  state.root = git_root()
-  M.open_source(commit_source(rev or "HEAD", state.root))
+  return open_with_notice("commit", function()
+    state.root = git_root()
+    M.open_source(commit_source(rev or "HEAD", state.root))
+  end)
 end
 
 function M.open_range(range)
-  state.root = git_root()
-  M.open_source(range_source(range, state.root))
+  return open_with_notice("range", function()
+    state.root = git_root()
+    M.open_source(range_source(range, state.root))
+  end)
 end
 
 function M.open_patch(path)
-  state.root = git_root()
-  M.open_source(patch_source(path))
+  return open_with_notice("patch", function()
+    state.root = git_root()
+    M.open_source(patch_source(path))
+  end)
+end
+
+function M.open_pr(number)
+  return open_with_notice("PR", function()
+    state.root = git_root()
+    M.open_source(pr_source(number))
+  end)
 end
 
 local function pick_recent_commit()
@@ -1679,13 +1815,99 @@ local function pick_recent_commit()
   end)
 end
 
+local function open_last_commits()
+  tracked_input({ prompt = "last N commits: ", default = "1" }, function(input)
+    local count = tonumber(input)
+    if count and count > 0 then
+      M.open_range("HEAD~" .. tostring(math.floor(count)) .. "..HEAD")
+    end
+  end)
+end
+
+local function pick_two_refs()
+  tracked_input({ prompt = "base ref: ", default = default_base_ref(state.root or git_root()) }, function(base)
+    if not base or base == "" then
+      return
+    end
+    tracked_input({ prompt = "head ref: ", default = "HEAD" }, function(head)
+      if head and head ~= "" then
+        M.open_range(base .. "..." .. head)
+      end
+    end)
+  end)
+end
+
+local function pick_pr()
+  if vim.fn.executable("gh") ~= 1 then
+    tracked_input({ prompt = "PR number: " }, function(input)
+      if input then
+        M.open_pr(input)
+      end
+    end)
+    return
+  end
+
+  state.root = git_root()
+  local choices = {}
+  local seen_prs = {}
+  local current_ok, current_output = pcall(system, { "gh", "pr", "view", "--json", "number,title,headRefName" }, { cwd = state.root })
+  if current_ok then
+    local decoded_ok, pr = pcall(vim.json.decode, current_output)
+    if decoded_ok and type(pr) == "table" and pr.number then
+      local number = tostring(pr.number)
+      seen_prs[number] = true
+      table.insert(choices, {
+        label = "Current branch PR: #" .. number .. " " .. tostring(pr.title or "") .. "  (" .. tostring(pr.headRefName or "") .. ")",
+        number = number,
+      })
+    end
+  end
+
+  local ok, output = pcall(system, { "gh", "pr", "list", "--limit", "30", "--json", "number,title,headRefName" }, { cwd = state.root })
+  if ok then
+    local decoded_ok, prs = pcall(vim.json.decode, output)
+    if decoded_ok and type(prs) == "table" then
+      for _, pr in ipairs(prs) do
+        local number = tostring(pr.number)
+        if not seen_prs[number] then
+          seen_prs[number] = true
+          table.insert(choices, {
+            label = "#" .. number .. " " .. tostring(pr.title or "") .. "  (" .. tostring(pr.headRefName or "") .. ")",
+            number = number,
+          })
+        end
+      end
+    end
+  end
+  table.insert(choices, { label = "Enter PR number…", number = nil })
+
+  vim.ui.select(choices, { prompt = "Pi review PR", format_item = function(item) return item.label end }, function(choice)
+    if not choice then
+      return
+    end
+    if choice.number == nil then
+      tracked_input({ prompt = "PR number: " }, function(input)
+        if input then
+          M.open_pr(input)
+        end
+      end)
+    else
+      M.open_pr(choice.number)
+    end
+  end)
+end
+
 function M.pick()
+  state.root = state.root or git_root()
   local choices = {
     { label = "Working tree", value = "working-tree" },
     { label = "Staged changes", value = "staged" },
-    { label = "PR / branch comparison", value = "branch" },
+    { label = "Current branch vs " .. default_base_ref(state.root), value = "branch" },
+    { label = "GitHub PR", value = "pr" },
+    { label = "Last N commits", value = "last" },
     { label = "Recent commit", value = "commit" },
     { label = "Commit range", value = "range" },
+    { label = "Pick base/head refs", value = "refs" },
     { label = "Patch file", value = "patch" },
     { label = "Custom git diff args", value = "custom" },
   }
@@ -1701,6 +1923,12 @@ function M.pick()
       end)
     elseif choice.value == "commit" then
       pick_recent_commit()
+    elseif choice.value == "last" then
+      open_last_commits()
+    elseif choice.value == "refs" then
+      pick_two_refs()
+    elseif choice.value == "pr" then
+      pick_pr()
     elseif choice.value == "range" then
       tracked_input({ prompt = "commit range: ", default = default_base_ref(state.root or git_root()) .. "...HEAD" }, function(input)
         if input then
@@ -1714,11 +1942,7 @@ function M.pick()
         end
       end)
     elseif choice.value == "branch" then
-      tracked_input({ prompt = "base ref: ", default = default_base_ref(state.root or git_root()) }, function(input)
-        if input and input ~= "" then
-          M.open_range(input .. "...HEAD")
-        end
-      end)
+      M.open_range(default_base_ref(state.root or git_root()) .. "...HEAD")
     else
       M.open(choice.value)
     end
@@ -1872,6 +2096,25 @@ local function setup_autocmds()
   })
 end
 
+function M.setup(opts)
+  opts = opts or {}
+  if opts.default_base ~= nil then
+    default_base_override = opts.default_base
+  end
+  if opts.watch_interval_ms ~= nil then
+    state.watch_interval_ms = tonumber(opts.watch_interval_ms) or state.watch_interval_ms
+  end
+  if opts.large_line_threshold ~= nil then
+    large_line_threshold = tonumber(opts.large_line_threshold) or large_line_threshold
+  end
+  if opts.omit_line_threshold ~= nil then
+    omit_line_threshold = tonumber(opts.omit_line_threshold) or omit_line_threshold
+  end
+  if opts.max_untracked_file_bytes ~= nil then
+    max_untracked_file_bytes = tonumber(opts.max_untracked_file_bytes) or max_untracked_file_bytes
+  end
+end
+
 M._test = {
   parse_diff = parse_diff,
   file_status = file_status,
@@ -1879,6 +2122,8 @@ M._test = {
   commit_source = commit_source,
   range_source = range_source,
   patch_source = patch_source,
+  pr_source = pr_source,
+  split_args = split_args,
   apply_large_safeguard = apply_large_safeguard,
   large_line_threshold = large_line_threshold,
   omit_line_threshold = omit_line_threshold,
@@ -1897,7 +2142,7 @@ function M.setup_commands()
     nargs = "*",
     force = true,
     complete = function()
-      return { "working-tree", "staged", "main", "origin/main", "branch", "pr" }
+      return { "working-tree", "staged", "main", "origin/main", "branch", "pr", "pr ", "HEAD~1..HEAD", "origin/main...HEAD" }
     end,
   })
 
@@ -1940,6 +2185,10 @@ function M.setup_commands()
       M.open_patch(opts.args)
     end
   end, { desc = "Open Pi review for a patch file", nargs = "?", complete = "file", force = true })
+
+  vim.api.nvim_create_user_command("PiovimReviewPR", function(opts)
+    M.open_pr(opts.args)
+  end, { desc = "Open Pi review for a GitHub PR via gh", nargs = "?", force = true })
 
   vim.api.nvim_create_user_command("PiovimReviewFiles", pick_file, { desc = "Pick Pi review file", force = true })
   vim.api.nvim_create_user_command("PiovimReviewToggleFiles", toggle_file_list, { desc = "Toggle Pi review file list", force = true })

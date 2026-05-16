@@ -95,6 +95,7 @@ Typed in the Piovim prompt:
 - `/thinking` opens thinking-level selection.
 - `/diff` opens the Pi review-source picker.
 - `/diff <args>` opens a Pi review diff with custom `git diff` args, e.g. `/diff main...HEAD`.
+- `/diff pr` or `/diff pr 123` opens the current branch PR or a numbered GitHub PR via `gh`.
 - `/apply` asks Pi to fix active review notes and resolve them as it goes.
 
 In the Pi prompt buffer, type a slash prefix and press `<Tab>` to complete slash commands. Multiple matches open a picker.
@@ -123,9 +124,11 @@ Mentions are intentionally plain text. Piovim does not paste selected code into 
 
 - working tree (`git diff`, including untracked files)
 - staged changes (`git diff --cached`)
-- PR / branch comparison (`<base>...HEAD`)
+- current branch vs default base (`<base>...HEAD`)
+- GitHub PR review via `gh pr diff`
+- last N commits
 - recent commit picker (`git show <sha>`)
-- commit range (`git diff <range>`)
+- commit range or picked base/head refs (`git diff <range>`)
 - patch file (`*.patch` / unified diff text)
 - custom `git diff` args
 
@@ -152,6 +155,8 @@ Inside the diff view:
 | `r` | Refresh current comparison |
 
 `:PiovimReviewNotes` opens all current review annotations in the quickfix list.
+
+Custom diff args support simple shell-like quoting for paths with spaces, e.g. `/diff main...HEAD -- "docs/my file.md"`.
 
 Review annotations are persisted outside the repo at `stdpath("state")/piovim/reviews/` and old review state files are pruned after 30 days. Comments are anchored by file, line, selected text, and nearby context; refresh attempts to re-anchor notes when edits move code.
 
@@ -209,6 +214,13 @@ require("piovim").setup({
     diff = "<leader>pd",
     close_diff = "<leader>pD",
   },
+  review = {
+    default_base = nil,
+    watch_interval_ms = 1500,
+    large_line_threshold = 5000,
+    omit_line_threshold = 20000,
+    max_untracked_file_bytes = 512 * 1024,
+  },
 })
 ```
 
@@ -238,6 +250,7 @@ Model/thinking settings are persisted at:
 - `:PiovimReviewCommit [rev]`
 - `:PiovimReviewRange [range]`
 - `:PiovimReviewPatch [patch-file]`
+- `:PiovimReviewPR [number]`
 - `:PiovimReviewFiles`
 - `:PiovimReviewToggleFiles`
 - `:PiovimReviewClose`

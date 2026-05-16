@@ -120,6 +120,27 @@ local function test_large_file_safeguard()
   assert_eq(rendered[1], "Large file omitted from Pi review rendering", "large placeholder")
 end
 
+local function test_split_args_with_quotes()
+  local args = T.split_args([[main...HEAD -- "path with spaces.lua" 'another path.ts']])
+  assert_eq(args[1], "main...HEAD", "split first arg")
+  assert_eq(args[2], "--", "split pathspec separator")
+  assert_eq(args[3], "path with spaces.lua", "split double quoted path")
+  assert_eq(args[4], "another path.ts", "split single quoted path")
+
+  local ok, err = pcall(T.split_args, [[main...HEAD "unterminated]])
+  assert_true(not ok and tostring(err):find("Unclosed quote", 1, true), "unclosed quote was not rejected")
+end
+
+local function test_pr_source()
+  local source = T.pr_source("123")
+  assert_eq(source.kind, "pr", "pr source kind")
+  assert_eq(source.label, "PR #123", "pr source label")
+
+  local parsed = T.source_from("pr 123", ".")
+  assert_eq(parsed.kind, "pr", "pr input parsed as pr source")
+  assert_eq(parsed.input, "123", "pr input number")
+end
+
 test_normal_diff()
 test_plain_unified_patch()
 test_deleted_file()
@@ -127,5 +148,7 @@ test_binary_file()
 test_rename_only_file()
 test_mode_only_file()
 test_large_file_safeguard()
+test_split_args_with_quotes()
+test_pr_source()
 
 print("review_diff_tests: ok")

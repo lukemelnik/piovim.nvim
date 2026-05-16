@@ -1,3 +1,5 @@
+local PluginBuffer = require("piovim.plugin_buffer")
+
 local M = {}
 
 local state = {
@@ -46,8 +48,7 @@ local function valid_win(win)
 end
 
 local function is_pi_buf(buf)
-  local ft = vim.bo[buf].filetype
-  return ft == "piovim-chat" or ft == "piovim-prompt"
+  return PluginBuffer.is_plugin_buffer(buf)
 end
 
 local function source_win()

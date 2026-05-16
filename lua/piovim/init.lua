@@ -25,6 +25,13 @@ local config = {
     diff = "<leader>pd",
     close_diff = "<leader>pD",
   },
+  review = {
+    default_base = nil,
+    watch_interval_ms = 1500,
+    large_line_threshold = 5000,
+    omit_line_threshold = 20000,
+    max_untracked_file_bytes = 512 * 1024,
+  },
   dev = {
     self_fix = false,
   },
@@ -184,6 +191,7 @@ function M.apply_review_fixes()
 end
 
 local slash_commands = {}
+local configured_keymaps = {}
 
 local function register_slash_commands()
   slash_commands = {
@@ -267,44 +275,38 @@ local function setup_commands()
   ReviewDiff.setup_commands()
 end
 
+local function set_keymap(modes, lhs, rhs, desc)
+  if not lhs then
+    return
+  end
+  vim.keymap.set(modes, lhs, rhs, { desc = desc })
+  table.insert(configured_keymaps, { modes = type(modes) == "table" and modes or { modes }, lhs = lhs })
+end
+
+local function clear_configured_keymaps()
+  for _, map in ipairs(configured_keymaps) do
+    for _, mode in ipairs(map.modes) do
+      pcall(vim.keymap.del, mode, map.lhs)
+    end
+  end
+  configured_keymaps = {}
+end
+
 local function setup_keymaps()
+  clear_configured_keymaps()
   local keys = config.keys or {}
-  if keys.toggle then
-    vim.keymap.set("n", keys.toggle, M.toggle, { desc = "Piovim toggle" })
-  end
-  if keys.ask then
-    vim.keymap.set({ "n", "v" }, keys.ask, M.prompt_input, { desc = "Piovim ask" })
-  end
-  if keys.append then
-    vim.keymap.set({ "n", "v" }, keys.append, M.append_context, { desc = "Pi append context mention" })
-  end
-  if keys.stop then
-    vim.keymap.set("n", keys.stop, M.stop, { desc = "Piovim stop" })
-  end
-  if keys.clear then
-    vim.keymap.set("n", keys.clear, M.clear, { desc = "Piovim clear" })
-  end
-  if keys.clear_highlights then
-    vim.keymap.set("n", keys.clear_highlights, M.clear_highlights, { desc = "Pi clear highlights" })
-  end
-  if keys.thinking_cycle then
-    vim.keymap.set("n", keys.thinking_cycle, M.cycle_thinking_level, { desc = "Pi thinking cycle" })
-  end
-  if keys.thinking_select then
-    vim.keymap.set("n", keys.thinking_select, M.select_thinking_level, { desc = "Pi thinking select" })
-  end
-  if keys.model_select then
-    vim.keymap.set("n", keys.model_select, M.select_model, { desc = "Pi model select" })
-  end
-  if keys.model_cycle then
-    vim.keymap.set("n", keys.model_cycle, M.cycle_model, { desc = "Pi model cycle" })
-  end
-  if keys.diff then
-    vim.keymap.set("n", keys.diff, ReviewDiff.pick, { desc = "Pi review diff" })
-  end
-  if keys.close_diff then
-    vim.keymap.set("n", keys.close_diff, ReviewDiff.close, { desc = "Pi close review diff" })
-  end
+  set_keymap("n", keys.toggle, M.toggle, "Piovim toggle")
+  set_keymap({ "n", "v" }, keys.ask, M.prompt_input, "Piovim ask")
+  set_keymap({ "n", "v" }, keys.append, M.append_context, "Pi append context mention")
+  set_keymap("n", keys.stop, M.stop, "Piovim stop")
+  set_keymap("n", keys.clear, M.clear, "Piovim clear")
+  set_keymap("n", keys.clear_highlights, M.clear_highlights, "Pi clear highlights")
+  set_keymap("n", keys.thinking_cycle, M.cycle_thinking_level, "Pi thinking cycle")
+  set_keymap("n", keys.thinking_select, M.select_thinking_level, "Pi thinking select")
+  set_keymap("n", keys.model_select, M.select_model, "Pi model select")
+  set_keymap("n", keys.model_cycle, M.cycle_model, "Pi model cycle")
+  set_keymap("n", keys.diff, ReviewDiff.pick, "Pi review diff")
+  set_keymap("n", keys.close_diff, ReviewDiff.close, "Pi close review diff")
 end
 
 local function handle_prompt_submit(text)
@@ -327,6 +329,7 @@ end
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
   Context.setup({ snippet_context_lines = config.snippet_context_lines })
+  ReviewDiff.setup(config.review or {})
   Bridge.setup_autocmds()
   register_slash_commands()
   Panel.set_on_submit(handle_prompt_submit)

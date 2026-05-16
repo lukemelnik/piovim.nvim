@@ -61,6 +61,18 @@ buffer_ops.edit_buffer({
 local edited_lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
 assert_true(edited_lines[1] == "const value = 1;", "range edit did not update empty buffer")
 
+local review_buf = vim.api.nvim_create_buf(false, true)
+vim.bo[review_buf].filetype = "lua"
+vim.api.nvim_buf_set_name(review_buf, "Pi Review NEW: fake.lua")
+vim.api.nvim_buf_set_lines(review_buf, 0, -1, false, { "local fake = true" })
+local ok, err = pcall(buffer_ops.edit_buffer, {
+  bufnr = review_buf,
+  rangeEdits = {
+    { startLine = 1, startCol = 0, endLine = 1, endCol = 0, newText = "local fake = false" },
+  },
+})
+assert_true(not ok and tostring(err):find("Piovim plugin buffer", 1, true), "review buffer edit was not rejected")
+
 panel.close()
 vim.cmd("%bdelete!")
 vim.fn.delete(tmp)

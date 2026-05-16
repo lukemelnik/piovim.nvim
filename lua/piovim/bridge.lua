@@ -11,6 +11,8 @@ local state = {
   token = nil,
 }
 
+local max_request_bytes = 1024 * 1024
+
 local handlers = {
   get_context = BufferOps.get_context,
   list_open_buffers = BufferOps.list_open_buffers,
@@ -69,6 +71,12 @@ local function handle_client(client)
     end
 
     pending = pending .. chunk
+    if #pending > max_request_bytes then
+      client:read_stop()
+      respond(client, { ok = false, error = "Neovim bridge request too large" })
+      return
+    end
+
     local newline = pending:find("\n", 1, true)
     if not newline then
       return

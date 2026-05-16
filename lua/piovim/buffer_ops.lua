@@ -1,4 +1,5 @@
 local EditPreview = require("piovim.edit_preview")
+local PluginBuffer = require("piovim.plugin_buffer")
 
 local M = {}
 
@@ -30,8 +31,7 @@ local function setup_highlights()
 end
 
 local function is_pi_buffer(buf)
-  local ft = vim.bo[buf].filetype
-  return ft == "piovim-chat" or ft == "piovim-prompt"
+  return PluginBuffer.is_plugin_buffer(buf)
 end
 
 local function valid_buf(buf)
@@ -147,7 +147,7 @@ local function ensure_changedtick(buf, expected, message)
 end
 
 local function is_file_backed(buf)
-  return vim.api.nvim_buf_get_name(buf) ~= "" and vim.bo[buf].buftype == ""
+  return PluginBuffer.is_file_backed_code_buffer(buf)
 end
 
 local function validate_range(buf, edit)
@@ -281,6 +281,10 @@ function M.edit_buffer(params)
 
   local edits = type(params.edits) == "table" and params.edits or {}
   local range_edits = type(params.rangeEdits or params.range_edits) == "table" and (params.rangeEdits or params.range_edits) or {}
+  if is_pi_buffer(buf) or not is_file_backed(buf) then
+    error("Refusing to edit non-file or Piovim plugin buffer")
+  end
+
   if #edits == 0 and #range_edits == 0 then
     error("Provide edits or rangeEdits")
   end
