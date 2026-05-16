@@ -2,6 +2,7 @@ local Bridge = require("piovim.bridge")
 local Context = require("piovim.context")
 local Panel = require("piovim.panel")
 local Rpc = require("piovim.rpc")
+local ReviewDiff = require("piovim.review_diff")
 local SelfFix = require("piovim.self_fix")
 
 local M = {}
@@ -21,6 +22,8 @@ local config = {
     thinking_cycle = "<leader>pT",
     model_select = "<leader>pm",
     model_cycle = "<leader>pM",
+    diff = "<leader>pd",
+    close_diff = "<leader>pD",
   },
   dev = {
     self_fix = false,
@@ -171,6 +174,29 @@ function M.cycle_model()
   end
 end
 
+function M.apply_review_fixes()
+  if not ensure_started() then
+    return
+  end
+  local message = ReviewDiff.summary()
+  Panel.user_message("/apply-fixes", "Active review diff notes")
+  Rpc.prompt(message)
+end
+
+local slash_commands = {}
+
+local function register_slash_commands()
+  slash_commands = {
+    { name = "/clear", description = "Clear Pi session", handler = M.clear },
+    { name = "/model", description = "Select model", handler = M.select_model },
+    { name = "/thinking", description = "Select thinking level", handler = M.select_thinking_level },
+    { name = "/pi-fix", description = "Append Piovim self-fix context", handler = M.append_self_fix_context },
+    { name = "/diff", description = "Open review diff picker", handler = ReviewDiff.pick, accepts_args = true },
+    { name = "/apply-fixes", description = "Ask Pi to apply active review notes", handler = M.apply_review_fixes },
+  }
+  Panel.set_slash_commands(slash_commands)
+end
+
 local function set_panel_keymaps(buf)
   local maps = {
     h = "Left",
@@ -201,10 +227,19 @@ local function set_panel_keymaps(buf)
       Panel.clear_prompt()
       vim.cmd("startinsert")
     end, { buffer = buf, desc = "Clear Pi prompt" })
-    vim.keymap.set({ "n", "i" }, "<Esc>", function()
+    vim.keymap.set("i", "<Esc>", "<Esc>", { buffer = buf, desc = "Leave insert mode" })
+    vim.keymap.set("n", "<Esc>", function()
       Rpc.abort()
-      vim.cmd("startinsert")
     end, { buffer = buf, desc = "Abort Pi turn" })
+    vim.keymap.set("i", "<Tab>", function()
+      if Panel.complete_slash_command() then
+        return ""
+      end
+      return vim.api.nvim_replace_termcodes("<Tab>", true, false, true)
+    end, { buffer = buf, desc = "Complete Pi slash command", expr = true })
+    vim.keymap.set("n", "<Tab>", function()
+      Panel.complete_slash_command()
+    end, { buffer = buf, desc = "Complete Pi slash command" })
     vim.keymap.set("n", "q", function()
       Panel.close()
     end, { buffer = buf, desc = "Close Pi panel" })
@@ -212,19 +247,24 @@ local function set_panel_keymaps(buf)
 end
 
 local function setup_commands()
-  vim.api.nvim_create_user_command("Piovim", M.open, { desc = "Open Piovim side panel" })
-  vim.api.nvim_create_user_command("PiovimToggle", M.toggle, { desc = "Toggle Piovim side panel" })
-  vim.api.nvim_create_user_command("PiovimAsk", M.prompt_input, { desc = "Ask Pi about current selection or buffer", range = true })
-  vim.api.nvim_create_user_command("PiovimStop", M.stop, { desc = "Stop Piovim process" })
-  vim.api.nvim_create_user_command("PiovimClear", M.clear, { desc = "Clear Piovim session" })
-  vim.api.nvim_create_user_command("PiovimClearHighlights", M.clear_highlights, { desc = "Clear Pi code highlights" })
-  vim.api.nvim_create_user_command("PiovimAppendContext", M.append_context, { desc = "Append current Pi context mention" })
-  vim.api.nvim_create_user_command("PiovimSelfFix", M.append_self_fix_context, { desc = "Append Piovim self-fix context" })
-  vim.api.nvim_create_user_command("PiovimAbort", M.abort, { desc = "Abort current Pi turn" })
-  vim.api.nvim_create_user_command("PiovimThinkingCycle", M.cycle_thinking_level, { desc = "Cycle Pi thinking level" })
-  vim.api.nvim_create_user_command("PiovimThinkingSelect", M.select_thinking_level, { desc = "Select Pi thinking level" })
-  vim.api.nvim_create_user_command("PiovimModelSelect", M.select_model, { desc = "Select Pi model" })
-  vim.api.nvim_create_user_command("PiovimModelCycle", M.cycle_model, { desc = "Cycle Pi model" })
+  local function command(name, callback, opts)
+    vim.api.nvim_create_user_command(name, callback, vim.tbl_extend("force", opts or {}, { force = true }))
+  end
+
+  command("Piovim", M.open, { desc = "Open Piovim side panel" })
+  command("PiovimToggle", M.toggle, { desc = "Toggle Piovim side panel" })
+  command("PiovimAsk", M.prompt_input, { desc = "Ask Pi about current selection or buffer", range = true })
+  command("PiovimStop", M.stop, { desc = "Stop Piovim process" })
+  command("PiovimClear", M.clear, { desc = "Clear Piovim session" })
+  command("PiovimClearHighlights", M.clear_highlights, { desc = "Clear Pi code highlights" })
+  command("PiovimAppendContext", M.append_context, { desc = "Append current Pi context mention" })
+  command("PiovimSelfFix", M.append_self_fix_context, { desc = "Append Piovim self-fix context" })
+  command("PiovimAbort", M.abort, { desc = "Abort current Pi turn" })
+  command("PiovimThinkingCycle", M.cycle_thinking_level, { desc = "Cycle Pi thinking level" })
+  command("PiovimThinkingSelect", M.select_thinking_level, { desc = "Select Pi thinking level" })
+  command("PiovimModelSelect", M.select_model, { desc = "Select Pi model" })
+  command("PiovimModelCycle", M.cycle_model, { desc = "Cycle Pi model" })
+  ReviewDiff.setup_commands()
 end
 
 local function setup_keymaps()
@@ -259,24 +299,27 @@ local function setup_keymaps()
   if keys.model_cycle then
     vim.keymap.set("n", keys.model_cycle, M.cycle_model, { desc = "Pi model cycle" })
   end
+  if keys.diff then
+    vim.keymap.set("n", keys.diff, ReviewDiff.pick, { desc = "Pi review diff" })
+  end
+  if keys.close_diff then
+    vim.keymap.set("n", keys.close_diff, ReviewDiff.close, { desc = "Pi close review diff" })
+  end
 end
 
 local function handle_prompt_submit(text)
-  if text == "/clear" then
-    M.clear()
-    return
-  end
-  if text == "/model" then
-    M.select_model()
-    return
-  end
-  if text == "/thinking" then
-    M.select_thinking_level()
-    return
-  end
-  if text == "/pi-fix" then
-    M.append_self_fix_context()
-    return
+  if text:sub(1, 1) == "/" then
+    local name, args = text:match("^(%S+)%s*(.*)$")
+    for _, command in ipairs(slash_commands) do
+      if command.name == name then
+        if command.name == "/diff" and args ~= "" then
+          ReviewDiff.open(args)
+        else
+          command.handler(args)
+        end
+        return
+      end
+    end
   end
   M.ask(text)
 end
@@ -285,6 +328,7 @@ function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
   Context.setup({ snippet_context_lines = config.snippet_context_lines })
   Bridge.setup_autocmds()
+  register_slash_commands()
   Panel.set_on_submit(handle_prompt_submit)
   setup_commands()
   setup_keymaps()
@@ -296,6 +340,14 @@ function M.setup(opts)
     pattern = { "piovim-chat", "piovim-prompt" },
     callback = function(event)
       set_panel_keymaps(event.buf)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+    group = group,
+    pattern = "piovim://prompt",
+    callback = function()
+      Panel.update_prompt_hints()
     end,
   })
 

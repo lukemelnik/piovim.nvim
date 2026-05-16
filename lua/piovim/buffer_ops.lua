@@ -372,6 +372,13 @@ function M.edit_buffer(params)
     return a.start_line < b.start_line
   end)
 
+  local path = path_for_buf(buf)
+  if path then
+    pcall(function()
+      require("piovim.review_diff").refresh_if_open(path)
+    end)
+  end
+
   return {
     buffer = buffer_summary(buf),
     applied = applied,

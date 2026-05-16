@@ -27,7 +27,15 @@ local function text_to_lines(text)
 end
 
 local function make_virt_line(prefix, line, hl_group)
-  return { { prefix .. line, hl_group } }
+  return { { prefix, hl_group }, { line, hl_group } }
+end
+
+local function non_empty_lines(text)
+  local lines = text_to_lines(text)
+  if #lines > 1 and lines[#lines] == "" then
+    table.remove(lines, #lines)
+  end
+  return lines
 end
 
 local function confirm(anchor)
@@ -126,20 +134,16 @@ function M.show(buf, previews)
   local line_count = vim.api.nvim_buf_line_count(buf)
   for _, preview in ipairs(previews) do
     local virt_lines = {
-      { { "╭─ π edit preview L" .. (preview.start_row + 1) .. "-" .. (preview.end_row + 1), "PiovimDiffHeader" } },
+      { { "π edit preview L" .. (preview.start_row + 1) .. "-" .. (preview.end_row + 1), "PiovimDiffHeader" } },
     }
-    for _, line in ipairs(text_to_lines(preview.edit.oldText)) do
-      virt_lines[#virt_lines + 1] = make_virt_line("- ", line, "PiovimDiffDelete")
-    end
-    for _, line in ipairs(text_to_lines(preview.edit.newText)) do
+    for _, line in ipairs(non_empty_lines(preview.edit.newText)) do
       virt_lines[#virt_lines + 1] = make_virt_line("+ ", line, "PiovimDiffAdd")
     end
-    virt_lines[#virt_lines + 1] = { { "╰─ Apply? confirm below", "PiovimDiffHeader" } }
 
     vim.api.nvim_buf_set_extmark(buf, ns, preview.start_row, preview.start_col, {
       end_row = preview.end_row,
       end_col = preview.end_col,
-      hl_group = "PiovimDiffChange",
+      hl_group = "PiovimDiffDelete",
       hl_eol = true,
       priority = 250,
     })
@@ -148,7 +152,7 @@ function M.show(buf, previews)
     vim.api.nvim_buf_set_extmark(buf, ns, anchor_row, 0, {
       priority = 251,
       virt_lines = virt_lines,
-      virt_lines_leftcol = true,
+      virt_lines_leftcol = false,
     })
   end
 

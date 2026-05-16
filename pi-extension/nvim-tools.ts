@@ -349,10 +349,99 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "nvim_get_review_diff",
+    label: "Get Review Diff",
+    description: "Get the active Pi review diff context, including comparison, changed files, current hunk, and review annotations.",
+    promptSnippet: "Get active Pi review diff context and annotations",
+    promptGuidelines: [
+      "Use nvim_get_review_diff when the user asks about the current review diff, current hunk, diff annotations, or wants help fixing review notes.",
+      "This tool reads Piovim's review diff UI state; use it instead of shelling out to git when the user is collaborating in the diff viewer.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, signal) {
+      const result = await callBridge("get_review_diff", {}, signal);
+      return {
+        content: [{ type: "text", text: "Active Pi review diff:\n" + jsonText(result) }],
+        details: result,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "nvim_add_review_annotation",
+    label: "Add Review Annotation",
+    description: "Add an annotation to the active Pi review diff. Omit range to annotate the current diff line.",
+    promptSnippet: "Add an annotation to the active Pi review diff",
+    promptGuidelines: [
+      "Use nvim_add_review_annotation when the user asks you to leave a review note on the current diff line or a specific diff range.",
+      "Prefer concise actionable notes that can be surfaced in the quickfix list and fixed later.",
+    ],
+    parameters: Type.Object({
+      note: Type.String({ description: "Review note text." }),
+      range: Type.Optional(Type.Object({
+        path: Type.String({ description: "Repo-relative file path in the diff." }),
+        line: Type.Number({ description: "1-indexed source line to anchor the note to." }),
+        end_line: Type.Optional(Type.Number({ description: "Optional 1-indexed end line for multi-line annotations." })),
+        old_line: Type.Optional(Type.Number({ description: "Old-side line number when applicable." })),
+        new_line: Type.Optional(Type.Number({ description: "New-side line number when applicable." })),
+        text: Type.Optional(Type.String({ description: "Diff line text being annotated." })),
+      })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const result = await callBridge("add_review_annotation", params, signal);
+      return {
+        content: [{ type: "text", text: "Added Pi review annotation.\n" + jsonText(result) }],
+        details: result,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "nvim_refresh_review_diff",
+    label: "Refresh Review Diff",
+    description: "Refresh the active Pi review diff from Git, disk, and live Neovim buffers.",
+    promptSnippet: "Refresh the active Pi review diff",
+    promptGuidelines: [
+      "Use nvim_refresh_review_diff after editing files referenced by the active review diff, especially after disk edits or completing review-note fixes.",
+    ],
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, signal) {
+      const result = await callBridge("refresh_review_diff", {}, signal);
+      return {
+        content: [{ type: "text", text: "Refreshed Pi review diff.\n" + jsonText(result) }],
+        details: result,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "nvim_resolve_review_annotation",
+    label: "Resolve Review Annotation",
+    description: "Resolve/remove a review annotation from the active Pi review diff after fixing it.",
+    promptSnippet: "Resolve/remove a Pi review annotation",
+    promptGuidelines: [
+      "Use nvim_resolve_review_annotation after you have fixed a specific active review annotation.",
+      "Prefer resolving by annotation id from nvim_get_review_diff. If no id is available, resolve by path and line.",
+    ],
+    parameters: Type.Object({
+      id: Type.Optional(Type.Number({ description: "Annotation id from nvim_get_review_diff." })),
+      path: Type.Optional(Type.String({ description: "Repo-relative file path for location-based resolution." })),
+      line: Type.Optional(Type.Number({ description: "1-indexed source line for location-based resolution." })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const result = await callBridge("resolve_review_annotation", params, signal);
+      return {
+        content: [{ type: "text", text: "Resolved Pi review annotation.\n" + jsonText(result) }],
+        details: result,
+      };
+    },
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     ctx.ui.setWidget("piovim:startup", [
-      "nvim_get_context, nvim_list_open_buffers, nvim_read_buffer, nvim_get_diagnostics, nvim_open_buffer, nvim_highlight_range, nvim_clear_highlights, nvim_save_buffer, nvim_close_buffer, nvim_edit_buffer",
-      "Open buffers are live Neovim state; nvim_edit_buffer applies unsaved undoable edits, nvim_save_buffer saves, nvim_close_buffer closes only unmodified buffers.",
+      "nvim_get_context, nvim_list_open_buffers, nvim_read_buffer, nvim_get_diagnostics, nvim_open_buffer, nvim_highlight_range, nvim_clear_highlights, nvim_save_buffer, nvim_close_buffer, nvim_edit_buffer, nvim_get_review_diff, nvim_add_review_annotation, nvim_refresh_review_diff, nvim_resolve_review_annotation",
+      "Open buffers are live Neovim state; nvim_edit_buffer applies unsaved undoable edits. Pi review diff tools expose the active diff, hunk, and annotations.",
     ]);
   });
 }

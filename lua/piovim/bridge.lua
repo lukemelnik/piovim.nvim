@@ -1,4 +1,5 @@
 local BufferOps = require("piovim.buffer_ops")
+local ReviewDiff = require("piovim.review_diff")
 
 local M = {}
 
@@ -21,6 +22,10 @@ local handlers = {
   edit_buffer = BufferOps.edit_buffer,
   save_buffer = BufferOps.save_buffer,
   close_buffer = BufferOps.close_buffer,
+  get_review_diff = ReviewDiff.get_context,
+  add_review_annotation = ReviewDiff.add_annotation,
+  resolve_review_annotation = ReviewDiff.resolve_annotation,
+  refresh_review_diff = ReviewDiff.refresh,
 }
 
 local function handle_request(req)

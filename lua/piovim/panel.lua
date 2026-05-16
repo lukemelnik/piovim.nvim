@@ -7,12 +7,16 @@ local state = {
   prompt_win = nil,
   active_assistant = false,
   on_submit = nil,
+  slash_commands = {},
   status = "",
 }
 
 local ns = vim.api.nvim_create_namespace("piovim")
 local pattern_ns = vim.api.nvim_create_namespace("piovim-patterns")
+local prompt_hint_ns = vim.api.nvim_create_namespace("piovim-prompt-hints")
 local highlights_ready = false
+local protection_ready = false
+local protecting = false
 
 local function setup_highlights()
   if highlights_ready then
@@ -28,6 +32,7 @@ local function setup_highlights()
   vim.api.nvim_set_hl(0, "PiovimPath", { default = true, link = "Directory" })
   vim.api.nvim_set_hl(0, "PiovimCode", { default = true, link = "String" })
   vim.api.nvim_set_hl(0, "PiovimPrompt", { default = true, link = "Question" })
+  vim.api.nvim_set_hl(0, "PiovimPromptHint", { default = true, link = "Comment" })
   vim.api.nvim_set_hl(0, "PiovimDivider", { default = true, link = "NonText" })
   vim.api.nvim_set_hl(0, "PiovimCancelled", { default = true, link = "DiagnosticError" })
 end
@@ -38,6 +43,42 @@ end
 
 local function valid_win(win)
   return win and vim.api.nvim_win_is_valid(win)
+end
+
+local function is_pi_buf(buf)
+  local ft = vim.bo[buf].filetype
+  return ft == "piovim-chat" or ft == "piovim-prompt"
+end
+
+local function source_win()
+  local best_win = nil
+  local best_area = 0
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    local buf = vim.api.nvim_win_get_buf(win)
+    if not is_pi_buf(buf) then
+      local area = vim.api.nvim_win_get_width(win) * vim.api.nvim_win_get_height(win)
+      if area > best_area then
+        best_win = win
+        best_area = area
+      end
+    end
+  end
+  return best_win
+end
+
+local function ensure_source_win()
+  local win = source_win()
+  if win then
+    return win
+  end
+
+  local current = vim.api.nvim_get_current_win()
+  vim.cmd("topleft vnew")
+  local created = vim.api.nvim_get_current_win()
+  if valid_win(current) then
+    vim.api.nvim_set_current_win(current)
+  end
+  return created
 end
 
 local function set_modifiable(buf, value)
@@ -79,6 +120,55 @@ local function start_markdown_highlighter(buf)
   pcall(vim.treesitter.start, buf, "markdown")
 end
 
+local function protect_panel_windows()
+  if protecting then
+    return
+  end
+  protecting = true
+
+  local focused = vim.api.nvim_get_current_win()
+  local moved_win = nil
+  local checks = {
+    { win = state.history_win, buf = state.history_buf },
+    { win = state.prompt_win, buf = state.prompt_buf },
+  }
+
+  for _, item in ipairs(checks) do
+    if valid_win(item.win) and valid_buf(item.buf) then
+      local current_buf = vim.api.nvim_win_get_buf(item.win)
+      if current_buf ~= item.buf then
+        if valid_buf(current_buf) and not is_pi_buf(current_buf) then
+          moved_win = ensure_source_win()
+          vim.api.nvim_win_set_buf(moved_win, current_buf)
+        end
+        vim.api.nvim_win_set_buf(item.win, item.buf)
+      end
+    end
+  end
+
+  if moved_win and valid_win(moved_win) then
+    vim.api.nvim_set_current_win(moved_win)
+  elseif valid_win(focused) then
+    vim.api.nvim_set_current_win(focused)
+  end
+
+  protecting = false
+end
+
+local function setup_protection()
+  if protection_ready then
+    return
+  end
+  protection_ready = true
+
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "WinEnter" }, {
+    group = vim.api.nvim_create_augroup("piovim-panel-protection", { clear = true }),
+    callback = function()
+      vim.schedule(protect_panel_windows)
+    end,
+  })
+end
+
 local function ensure_history_buf()
   if valid_buf(state.history_buf) then
     return state.history_buf
@@ -115,6 +205,7 @@ local function ensure_prompt_buf()
   vim.bo[state.prompt_buf].bufhidden = "hide"
   vim.bo[state.prompt_buf].swapfile = false
   vim.bo[state.prompt_buf].filetype = "piovim-prompt"
+  vim.b[state.prompt_buf].completion = false
   vim.api.nvim_buf_set_name(state.prompt_buf, "piovim://prompt")
   vim.api.nvim_buf_set_lines(state.prompt_buf, 0, -1, false, { "" })
 
@@ -138,7 +229,14 @@ local function set_history_win_options(win)
   vim.wo[win].foldenable = false
 end
 
+local function hide_completion_menu()
+  pcall(function()
+    require("blink.cmp").hide()
+  end)
+end
+
 local function set_prompt_win_options(win)
+  hide_completion_menu()
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
   vim.wo[win].number = false
@@ -152,6 +250,7 @@ end
 
 function M.open(opts)
   opts = opts or {}
+  setup_protection()
   local history_buf = ensure_history_buf()
   local prompt_buf = ensure_prompt_buf()
 
@@ -181,6 +280,9 @@ function M.open(opts)
   end
 
   scroll_to_bottom()
+  pcall(function()
+    require("piovim.review_diff").resize_if_open()
+  end)
   return state.history_win
 end
 
@@ -193,6 +295,11 @@ function M.close()
   end
   state.prompt_win = nil
   state.history_win = nil
+  vim.schedule(function()
+    pcall(function()
+      require("piovim.review_diff").resize_if_open()
+    end)
+  end)
 end
 
 function M.toggle(opts)
@@ -218,6 +325,7 @@ end
 function M.focus_prompt()
   M.open({ focus_prompt = true })
   if valid_win(state.prompt_win) then
+    hide_completion_menu()
     vim.api.nvim_set_current_win(state.prompt_win)
     vim.cmd("startinsert")
   end
@@ -247,6 +355,53 @@ end
 
 function M.set_on_submit(callback)
   state.on_submit = callback
+end
+
+function M.set_slash_commands(commands)
+  state.slash_commands = commands or {}
+end
+
+local function matching_slash_commands(prefix)
+  local matches = {}
+  for _, command in ipairs(state.slash_commands or {}) do
+    if command.name:sub(1, #prefix) == prefix then
+      matches[#matches + 1] = command
+    end
+  end
+  return matches
+end
+
+function M.update_prompt_hints()
+  local buf = ensure_prompt_buf()
+  setup_highlights()
+  vim.api.nvim_buf_clear_namespace(buf, prompt_hint_ns, 0, -1)
+
+  local text = M.prompt_text()
+  if text:sub(1, 1) ~= "/" or text:find("%s") then
+    return
+  end
+
+  local matches = matching_slash_commands(text)
+  if #matches == 0 then
+    vim.api.nvim_buf_set_extmark(buf, prompt_hint_ns, 0, 0, {
+      virt_lines = { { { "  No Pi slash commands match " .. text, "PiovimPromptHint" } } },
+    })
+    return
+  end
+
+  local hint_lines = {}
+  local max_items = math.min(#matches, 5)
+  for i = 1, max_items do
+    local item = matches[i]
+    hint_lines[#hint_lines + 1] = { { "  " .. item.name .. " — " .. (item.description or ""), "PiovimPromptHint" } }
+  end
+  if #matches > max_items then
+    hint_lines[#hint_lines + 1] = { { "  …" .. tostring(#matches - max_items) .. " more", "PiovimPromptHint" } }
+  end
+
+  vim.api.nvim_buf_set_extmark(buf, prompt_hint_ns, 0, 0, {
+    virt_lines = hint_lines,
+  })
 end
 
 local function normalize_lines(lines)
@@ -379,6 +534,7 @@ end
 function M.clear_prompt()
   local buf = ensure_prompt_buf()
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
+  M.update_prompt_hints()
 end
 
 function M.set_prompt_text(text)
@@ -388,6 +544,7 @@ function M.set_prompt_text(text)
     lines = { "" }
   end
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  M.update_prompt_hints()
   if valid_win(state.prompt_win) then
     local last_line = #lines
     local last_col = #(lines[last_line] or "")
@@ -404,6 +561,40 @@ function M.append_prompt_text(text)
   else
     M.set_prompt_text(existing .. " " .. text)
   end
+end
+
+function M.complete_slash_command()
+  local text = M.prompt_text()
+  if text:sub(1, 1) ~= "/" or text:find("%s") then
+    return false
+  end
+
+  local matches = matching_slash_commands(text)
+  if #matches == 0 then
+    vim.notify("No matching Pi slash command", vim.log.levels.INFO)
+    return true
+  end
+  if #matches == 1 then
+    local name = matches[1].name
+    vim.schedule(function()
+      M.set_prompt_text(name)
+    end)
+    return true
+  end
+
+  vim.ui.select(matches, {
+    prompt = "Pi command",
+    format_item = function(item)
+      return item.name .. " — " .. (item.description or "")
+    end,
+  }, function(choice)
+    if choice then
+      vim.schedule(function()
+        M.set_prompt_text(choice.name)
+      end)
+    end
+  end)
+  return true
 end
 
 function M.submit_prompt()

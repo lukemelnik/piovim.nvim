@@ -1,0 +1,1439 @@
+local M = {}
+
+local state = {
+  root = nil,
+  comparison = nil,
+  files = {},
+  file_index = 1,
+  annotations = {},
+  list_buf = nil,
+  old_buf = nil,
+  new_buf = nil,
+  list_win = nil,
+  old_win = nil,
+  new_win = nil,
+  previous_win = nil,
+  previous_buf = nil,
+  comments_expanded = true,
+  next_annotation_id = 1,
+}
+
+local ns = vim.api.nvim_create_namespace("piovim-review-diff")
+local state_version = 1
+
+local function valid_buf(buf)
+  return buf and vim.api.nvim_buf_is_valid(buf)
+end
+
+local function valid_win(win)
+  return win and vim.api.nvim_win_is_valid(win)
+end
+
+local function is_piovim_buf(buf)
+  local ft = vim.bo[buf].filetype
+  local name = vim.api.nvim_buf_get_name(buf)
+  return ft:match("^piovim%-") ~= nil or name:match("Pi Review") ~= nil
+end
+
+local function source_win()
+  local best_win = nil
+  local best_area = 0
+
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    local buf = vim.api.nvim_win_get_buf(win)
+    if not is_piovim_buf(buf) then
+      local area = vim.api.nvim_win_get_width(win) * vim.api.nvim_win_get_height(win)
+      if area > best_area then
+        best_win = win
+        best_area = area
+      end
+    end
+  end
+
+  return best_win
+end
+
+local function state_dir()
+  return vim.fn.stdpath("state") .. "/piovim/reviews"
+end
+
+local function repo_key(root)
+  return vim.fn.sha256(root or "no-root"):sub(1, 16)
+end
+
+local function state_path(root)
+  return state_dir() .. "/" .. repo_key(root) .. ".json"
+end
+
+local function ensure_state_dir()
+  vim.fn.mkdir(state_dir(), "p")
+end
+
+local function prune_old_state_files()
+  ensure_state_dir()
+  local now = os.time()
+  for _, path in ipairs(vim.fn.glob(state_dir() .. "/*.json", false, true)) do
+    local stat = vim.uv.fs_stat(path)
+    if stat and stat.mtime and now - stat.mtime.sec > 30 * 24 * 60 * 60 then
+      pcall(vim.fn.delete, path)
+    end
+  end
+end
+
+local function save_state()
+  if not state.root then
+    return
+  end
+  ensure_state_dir()
+  local payload = {
+    version = state_version,
+    root = state.root,
+    comparison_input = state.comparison and state.comparison.input or nil,
+    annotations = state.annotations,
+    next_annotation_id = state.next_annotation_id,
+    updated_at = os.time(),
+  }
+  vim.fn.writefile({ vim.json.encode(payload) }, state_path(state.root))
+end
+
+local function load_state(root)
+  local path = state_path(root)
+  if vim.fn.filereadable(path) ~= 1 then
+    return
+  end
+  local ok, payload = pcall(vim.json.decode, table.concat(vim.fn.readfile(path), "\n"))
+  if not ok or type(payload) ~= "table" or payload.root ~= root then
+    return
+  end
+  if type(payload.annotations) == "table" then
+    state.annotations = payload.annotations
+  end
+  if type(payload.next_annotation_id) == "number" then
+    state.next_annotation_id = payload.next_annotation_id
+  end
+end
+
+local function system(args, opts)
+  opts = opts or {}
+  local result = vim.system(args, { cwd = opts.cwd, text = true }):wait()
+  if result.code ~= 0 then
+    error(vim.trim(result.stderr ~= "" and result.stderr or result.stdout))
+  end
+  return result.stdout or ""
+end
+
+local function git_output(args, root)
+  return system(vim.list_extend({ "git" }, args), { cwd = root })
+end
+
+local function git_root()
+  return vim.trim(system({ "git", "rev-parse", "--show-toplevel" }))
+end
+
+local function git_ref_exists(root, ref)
+  local result = vim.system({ "git", "rev-parse", "--verify", "--quiet", ref }, { cwd = root, text = true }):wait()
+  return result.code == 0
+end
+
+local function split_args(text)
+  local args = {}
+  for arg in string.gmatch(text or "", "%S+") do
+    table.insert(args, arg)
+  end
+  return args
+end
+
+local function comparison_from(input, root)
+  input = vim.trim(input or "")
+  if input == "" or input == "working" or input == "worktree" or input == "working-tree" then
+    return {
+      label = "working tree",
+      input = input,
+      args = { "diff", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" },
+      old_source = "HEAD",
+      new_source = "worktree",
+      include_untracked = true,
+    }
+  end
+
+  if input == "staged" or input == "cached" or input == "index" then
+    return {
+      label = "staged",
+      input = input,
+      args = { "diff", "--cached", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" },
+      old_source = "HEAD",
+      new_source = "index",
+    }
+  end
+
+  if input == "main" or input == "origin" or input == "origin/main" then
+    local ref = input == "origin" and "origin/main" or input
+    if input == "main" and not git_ref_exists(root, "main") and git_ref_exists(root, "origin/main") then
+      ref = "origin/main"
+    end
+    return {
+      label = ref .. "...HEAD",
+      input = input,
+      args = { "diff", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", ref .. "...HEAD" },
+      old_source = ref,
+      new_source = "HEAD",
+    }
+  end
+
+  local args = { "diff", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" }
+  vim.list_extend(args, split_args(input))
+  return { label = input, input = input, args = args, old_source = nil, new_source = "worktree" }
+end
+
+local function new_file(path)
+  return {
+    path = path,
+    old_path = path,
+    old_null = false,
+    new_null = false,
+    hunks = {},
+  }
+end
+
+local function parse_hunk_header(line)
+  local old_start, old_count, new_start, new_count = line:match("^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@")
+  if not old_start then
+    return nil
+  end
+  return {
+    header = line,
+    old_start = tonumber(old_start),
+    old_count = old_count ~= "" and tonumber(old_count) or 1,
+    new_start = tonumber(new_start),
+    new_count = new_count ~= "" and tonumber(new_count) or 1,
+  }
+end
+
+local function untracked_diff(root)
+  local output = git_output({ "ls-files", "--others", "--exclude-standard" }, root)
+  local chunks = {}
+
+  for _, path in ipairs(vim.split(output, "\n", { plain = true, trimempty = true })) do
+    local full_path = root .. "/" .. path
+    if vim.fn.filereadable(full_path) == 1 then
+      local lines = vim.fn.readfile(full_path)
+      table.insert(chunks, "diff --git a/" .. path .. " b/" .. path)
+      table.insert(chunks, "new file mode 100644")
+      table.insert(chunks, "index 0000000..0000000")
+      table.insert(chunks, "--- /dev/null")
+      table.insert(chunks, "+++ b/" .. path)
+      table.insert(chunks, "@@ -0,0 +1," .. tostring(#lines) .. " @@")
+      for _, line in ipairs(lines) do
+        table.insert(chunks, "+" .. line)
+      end
+    end
+  end
+
+  return table.concat(chunks, "\n")
+end
+
+local function parse_diff(text)
+  local files = {}
+  local file = nil
+
+  for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
+    local path = line:match("^diff %-%-git a/(.-) b/")
+    if path then
+      file = new_file(path)
+      table.insert(files, file)
+    elseif file then
+      if line == "--- /dev/null" then
+        file.old_null = true
+      elseif line == "+++ /dev/null" then
+        file.new_null = true
+      else
+        local old_path = line:match("^%-%-%- a/(.+)")
+        local new_path = line:match("^%+%+%+ b/(.+)")
+        if old_path then
+          file.old_path = old_path
+        elseif new_path then
+          file.path = new_path
+        end
+      end
+
+      local hunk = parse_hunk_header(line)
+      if hunk then
+        table.insert(file.hunks, hunk)
+      end
+    end
+  end
+
+  return files
+end
+
+local function current_file()
+  return state.files[state.file_index]
+end
+
+local function file_status(file)
+  if file.old_null then
+    return "A"
+  elseif file.new_null then
+    return "D"
+  end
+  return "M"
+end
+
+local function file_icon(path)
+  local ok, devicons = pcall(require, "nvim-web-devicons")
+  if not ok then
+    return "", ""
+  end
+
+  local ext = vim.fn.fnamemodify(path, ":e")
+  local icon, hl = devicons.get_icon(path, ext, { default = true })
+  return icon or "", hl or ""
+end
+
+local side_lines
+
+local function annotation_key(path, line)
+  return path .. ":" .. tostring(line)
+end
+
+local function annotations_for(path, line)
+  return state.annotations[annotation_key(path, line)] or {}
+end
+
+local function current_new_lines()
+  if valid_buf(state.new_buf) then
+    return vim.api.nvim_buf_get_lines(state.new_buf, 0, -1, false)
+  end
+  local file = current_file()
+  return file and side_lines(file, "new") or {}
+end
+
+local function line_text_at(lines, line)
+  return lines[math.max(1, line)] or ""
+end
+
+local function normalize_snippet(text)
+  return vim.trim((text or ""):gsub("%s+", " "))
+end
+
+local function find_unique_snippet(lines, snippet)
+  snippet = normalize_snippet(snippet)
+  if snippet == "" then
+    return nil
+  end
+
+  local match = nil
+  for i, line in ipairs(lines) do
+    if normalize_snippet(line) == snippet then
+      if match then
+        return nil
+      end
+      match = i
+    end
+  end
+  return match
+end
+
+local function reanchor_annotation(note, lines)
+  if not note or not note.line then
+    return
+  end
+  local current = line_text_at(lines, note.line)
+  if note.anchor_text and normalize_snippet(current) == normalize_snippet(note.anchor_text) then
+    note.stale = false
+    return
+  end
+
+  local start_line = math.max(1, note.line - 20)
+  local end_line = math.min(#lines, note.line + 20)
+  local anchor = normalize_snippet(note.anchor_text or note.text)
+  if anchor ~= "" then
+    local found = nil
+    for line = start_line, end_line do
+      if normalize_snippet(lines[line]) == anchor then
+        found = line
+        break
+      end
+    end
+    if found then
+      local delta = found - note.line
+      note.line = found
+      note.new_line = found
+      if note.end_line then
+        note.end_line = math.max(found, note.end_line + delta)
+      end
+      note.stale = false
+      return
+    end
+
+    local unique = find_unique_snippet(lines, anchor)
+    if unique then
+      local delta = unique - note.line
+      note.line = unique
+      note.new_line = unique
+      if note.end_line then
+        note.end_line = math.max(unique, note.end_line + delta)
+      end
+      note.stale = false
+      return
+    end
+  end
+
+  note.stale = true
+end
+
+local function reanchor_annotations_for_file(file)
+  if not file then
+    return
+  end
+
+  local lines = side_lines(file, "new")
+  local moved = {}
+  for key, notes in pairs(state.annotations) do
+    if key:sub(1, #file.path + 1) == file.path .. ":" then
+      for _, note in ipairs(notes) do
+        reanchor_annotation(note, lines)
+        local new_key = annotation_key(note.path, note.line)
+        moved[new_key] = moved[new_key] or {}
+        table.insert(moved[new_key], note)
+      end
+      state.annotations[key] = nil
+    end
+  end
+  for key, notes in pairs(moved) do
+    state.annotations[key] = state.annotations[key] or {}
+    vim.list_extend(state.annotations[key], notes)
+  end
+end
+
+local function setup_highlights()
+  local normal = vim.api.nvim_get_hl(0, { name = "Normal", link = false })
+  local float = vim.api.nvim_get_hl(0, { name = "NormalFloat", link = false })
+  local border = vim.api.nvim_get_hl(0, { name = "FloatBorder", link = false })
+  local hint = vim.api.nvim_get_hl(0, { name = "DiagnosticHint", link = false })
+  local comment = vim.api.nvim_get_hl(0, { name = "Comment", link = false })
+  local bg = float.bg or normal.bg
+
+  vim.api.nvim_set_hl(0, "PiovimReviewComment", { default = true, fg = normal.fg, bg = bg })
+  vim.api.nvim_set_hl(0, "PiovimReviewCommentBorder", { default = true, fg = border.fg or hint.fg or comment.fg, bg = bg })
+  vim.api.nvim_set_hl(0, "PiovimReviewCommentHeader", { default = true, fg = hint.fg or normal.fg, bg = bg, bold = true })
+  vim.api.nvim_set_hl(0, "PiovimReviewCommentMuted", { default = true, fg = comment.fg, bg = bg })
+  vim.api.nvim_set_hl(0, "PiovimReviewCommentSpacer", { default = true, fg = bg, bg = bg })
+end
+
+local function lock_review_buf(buf)
+  if valid_buf(buf) and vim.api.nvim_buf_get_name(buf):match("Pi Review") then
+    vim.bo[buf].readonly = true
+    vim.bo[buf].modifiable = false
+    vim.bo[buf].modified = false
+  end
+end
+
+local function set_buf_lines(buf, lines)
+  vim.bo[buf].readonly = false
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  lock_review_buf(buf)
+end
+
+local function filetype_for(path)
+  local ft = vim.filetype.match({ filename = path })
+  return ft or ""
+end
+
+local function read_git_file(root, ref, path)
+  if not ref or not path then
+    return {}
+  end
+  local result = vim.system({ "git", "show", ref .. ":" .. path }, { cwd = root, text = true }):wait()
+  if result.code ~= 0 then
+    return {}
+  end
+  return vim.split(result.stdout or "", "\n", { plain = true })
+end
+
+local function read_index_file(root, path)
+  local result = vim.system({ "git", "show", ":" .. path }, { cwd = root, text = true }):wait()
+  if result.code ~= 0 then
+    return {}
+  end
+  return vim.split(result.stdout or "", "\n", { plain = true })
+end
+
+local function read_loaded_file(root, path)
+  local full_path = vim.fn.fnamemodify(root .. "/" .. path, ":p")
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf) and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":p") == full_path then
+      return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    end
+  end
+  return nil
+end
+
+local function read_worktree_file(root, path)
+  local loaded = read_loaded_file(root, path)
+  if loaded then
+    return loaded
+  end
+
+  local full_path = root .. "/" .. path
+  if vim.fn.filereadable(full_path) ~= 1 then
+    return {}
+  end
+  return vim.fn.readfile(full_path)
+end
+
+side_lines = function(file, side)
+  local comparison = state.comparison or {}
+  if side == "old" then
+    if file.old_null then
+      return {}
+    end
+    return read_git_file(state.root, comparison.old_source, file.old_path)
+  end
+
+  if file.new_null then
+    return {}
+  end
+  if comparison.new_source == "index" then
+    return read_index_file(state.root, file.path)
+  elseif comparison.new_source == "HEAD" then
+    return read_git_file(state.root, "HEAD", file.path)
+  elseif comparison.new_source and comparison.new_source ~= "worktree" then
+    return read_git_file(state.root, comparison.new_source, file.path)
+  end
+  return read_worktree_file(state.root, file.path)
+end
+
+local function clear_diff_windows()
+  for _, win in ipairs({ state.old_win, state.new_win }) do
+    if valid_win(win) then
+      pcall(vim.api.nvim_set_current_win, win)
+      pcall(vim.cmd, "diffoff")
+      pcall(vim.wo, win, "foldenable", false)
+    end
+  end
+end
+
+local function render_list()
+  if not valid_buf(state.list_buf) then
+    return
+  end
+  vim.api.nvim_buf_clear_namespace(state.list_buf, ns, 0, -1)
+  local lines = { "Changes (" .. tostring(#state.files) .. ")" }
+  for i, file in ipairs(state.files) do
+    local prefix = i == state.file_index and "▸ " or "  "
+    local icon = file_icon(file.path)
+    local note_count = 0
+    for key, notes in pairs(state.annotations) do
+      if key:sub(1, #file.path + 1) == file.path .. ":" then
+        note_count = note_count + #notes
+      end
+    end
+    local suffix = note_count > 0 and ("  (" .. note_count .. ")") or ""
+    table.insert(lines, prefix .. icon .. " " .. file.path .. "  " .. file_status(file) .. suffix)
+  end
+  if #state.files == 0 then
+    table.insert(lines, "No changes")
+  end
+  set_buf_lines(state.list_buf, lines)
+
+  for i, file in ipairs(state.files) do
+    local icon, icon_hl = file_icon(file.path)
+    local row = i
+    if icon_hl ~= "" then
+      local col = (i == state.file_index) and 2 or 2
+      vim.api.nvim_buf_set_extmark(state.list_buf, ns, row, col, {
+        end_col = col + #icon,
+        hl_group = icon_hl,
+      })
+    end
+  end
+end
+
+local function wrap_text(text, width)
+  width = math.max(24, width or 72)
+  local wrapped = {}
+  for _, raw_line in ipairs(vim.split(text or "", "\n", { plain = true })) do
+    local line = raw_line
+    if line == "" then
+      table.insert(wrapped, "")
+    end
+    while #line > width do
+      local chunk = line:sub(1, width)
+      local break_at = chunk:match("^.*()%s+")
+      if break_at and break_at > 8 then
+        table.insert(wrapped, vim.trim(line:sub(1, break_at - 1)))
+        line = vim.trim(line:sub(break_at + 1))
+      else
+        table.insert(wrapped, chunk)
+        line = line:sub(width + 1)
+      end
+    end
+    if line ~= "" then
+      table.insert(wrapped, line)
+    end
+  end
+  return wrapped
+end
+
+local function note_header(note)
+  local line_label = tostring(note.line)
+  if note.end_line and note.end_line ~= note.line then
+    line_label = line_label .. "–" .. tostring(note.end_line)
+  end
+  local suffix = note.stale and "  (stale anchor)" or ""
+  return "Review note ▸ new " .. line_label .. suffix
+end
+
+local function pad_line(text, width)
+  text = text or ""
+  if #text >= width then
+    return text:sub(1, width)
+  end
+  return text .. string.rep(" ", width - #text)
+end
+
+local function card_width()
+  local win_width = valid_win(state.new_win) and vim.api.nvim_win_get_width(state.new_win) or 88
+  return math.max(32, win_width - 8)
+end
+
+local function comment_virtual_lines(notes)
+  local width = card_width()
+  local content_width = width - 4
+  local lines = {}
+
+  for index, note in ipairs(notes) do
+    if index > 1 then
+      table.insert(lines, { { "  " .. pad_line("", width), "PiovimReviewCommentSpacer" } })
+    end
+
+    table.insert(lines, { { "  ╭" .. string.rep("─", width - 2) .. "╮", "PiovimReviewCommentBorder" } })
+    table.insert(lines, { { "  │ " .. pad_line(note_header(note), content_width), "PiovimReviewCommentHeader" }, { " │", "PiovimReviewCommentBorder" } })
+    for _, body_line in ipairs(wrap_text(note.note, content_width)) do
+      table.insert(lines, { { "  │ " .. pad_line(body_line, content_width), "PiovimReviewComment" }, { " │", "PiovimReviewCommentBorder" } })
+    end
+    table.insert(lines, { { "  ╰" .. string.rep("─", width - 2) .. "╯", "PiovimReviewCommentBorder" } })
+  end
+
+  return lines
+end
+
+local function old_line_for_new_line(file, new_line)
+  if file.old_null then
+    return 1
+  end
+
+  for _, hunk in ipairs(file.hunks) do
+    local new_end = hunk.new_start + math.max(0, hunk.new_count - 1)
+    if new_line >= hunk.new_start and new_line <= new_end then
+      if hunk.old_count == 0 then
+        return math.max(1, hunk.old_start)
+      end
+      local delta = new_line - hunk.new_start
+      return math.max(1, math.min(hunk.old_start + delta, hunk.old_start + hunk.old_count - 1))
+    end
+  end
+
+  return new_line
+end
+
+local function empty_virtual_lines(count)
+  local width = card_width() + 2
+  local lines = {}
+  for _ = 1, count do
+    table.insert(lines, { { string.rep(" ", width), "PiovimReviewCommentSpacer" } })
+  end
+  return lines
+end
+
+local function render_annotations()
+  if not valid_buf(state.new_buf) then
+    return
+  end
+  setup_highlights()
+  vim.api.nvim_buf_clear_namespace(state.new_buf, ns, 0, -1)
+  if valid_buf(state.old_buf) then
+    vim.api.nvim_buf_clear_namespace(state.old_buf, ns, 0, -1)
+  end
+  local file = current_file()
+  if not file then
+    return
+  end
+
+  for key, notes in pairs(state.annotations) do
+    if key:sub(1, #file.path + 1) == file.path .. ":" then
+      local line = tonumber(key:match(":(%d+)$"))
+      if line and line > 0 and line <= vim.api.nvim_buf_line_count(state.new_buf) then
+        if state.comments_expanded then
+          local virt_lines = comment_virtual_lines(notes)
+          vim.api.nvim_buf_set_extmark(state.new_buf, ns, line - 1, 0, {
+            virt_lines = virt_lines,
+            virt_lines_above = false,
+          })
+
+          if valid_buf(state.old_buf) then
+            local old_line = old_line_for_new_line(file, line)
+            local old_line_count = vim.api.nvim_buf_line_count(state.old_buf)
+            old_line = math.max(1, math.min(old_line_count, old_line))
+            vim.api.nvim_buf_set_extmark(state.old_buf, ns, old_line - 1, 0, {
+              virt_lines = empty_virtual_lines(#virt_lines),
+              virt_lines_above = false,
+            })
+          end
+        else
+          vim.api.nvim_buf_set_extmark(state.new_buf, ns, line - 1, 0, {
+            virt_text = { { " 󰍩 " .. tostring(#notes) .. " note" .. (#notes == 1 and "" or "s"), "DiagnosticWarn" } },
+            virt_text_pos = "eol",
+          })
+        end
+      end
+    end
+  end
+end
+
+function M.resize_if_open()
+  if not (valid_win(state.list_win) and valid_win(state.old_win) and valid_win(state.new_win)) then
+    return false
+  end
+
+  pcall(vim.api.nvim_win_set_width, state.list_win, 28)
+  local old_width = vim.api.nvim_win_get_width(state.old_win)
+  local new_width = vim.api.nvim_win_get_width(state.new_win)
+  local total = old_width + new_width
+  if total > 20 then
+    pcall(vim.api.nvim_win_set_width, state.old_win, math.floor(total / 2))
+    pcall(vim.api.nvim_win_set_width, state.new_win, math.ceil(total / 2))
+  end
+  render_annotations()
+  return true
+end
+
+local function render_file()
+  local file = current_file()
+  if not file or not valid_buf(state.old_buf) or not valid_buf(state.new_buf) then
+    if valid_buf(state.old_buf) then
+      set_buf_lines(state.old_buf, { "No diff to show." })
+    end
+    if valid_buf(state.new_buf) then
+      set_buf_lines(state.new_buf, { "No diff to show." })
+    end
+    return
+  end
+
+  clear_diff_windows()
+  set_buf_lines(state.old_buf, side_lines(file, "old"))
+  set_buf_lines(state.new_buf, side_lines(file, "new"))
+  reanchor_annotations_for_file(file)
+  save_state()
+
+  local ft = filetype_for(file.path)
+  vim.bo[state.old_buf].filetype = ft
+  vim.bo[state.new_buf].filetype = ft
+  vim.api.nvim_buf_set_name(state.old_buf, "Pi Review OLD: " .. file.old_path)
+  vim.api.nvim_buf_set_name(state.new_buf, "Pi Review NEW: " .. file.path)
+
+  if valid_win(state.old_win) and valid_win(state.new_win) then
+    vim.wo[state.old_win].foldenable = false
+    vim.wo[state.new_win].foldenable = false
+    if not file.old_null and not file.new_null then
+      vim.api.nvim_set_current_win(state.old_win)
+      vim.cmd("diffthis")
+      vim.api.nvim_set_current_win(state.new_win)
+      vim.cmd("diffthis")
+    end
+  end
+
+  local first_hunk = file.hunks[1]
+  if first_hunk and valid_win(state.new_win) then
+    pcall(vim.api.nvim_win_set_cursor, state.new_win, { math.max(1, first_hunk.new_start), 0 })
+    if valid_win(state.old_win) then
+      pcall(vim.api.nvim_win_set_cursor, state.old_win, { math.max(1, first_hunk.old_start), 0 })
+    end
+  end
+
+  render_annotations()
+end
+
+local function select_file(index)
+  if #state.files == 0 then
+    return
+  end
+  state.file_index = math.max(1, math.min(index, #state.files))
+  render_list()
+  render_file()
+end
+
+local function current_range()
+  local file = current_file()
+  if not file then
+    return nil
+  end
+
+  local win = valid_win(state.new_win) and state.new_win or vim.api.nvim_get_current_win()
+  local line = vim.api.nvim_win_get_cursor(win)[1]
+  local buffer_lines = valid_buf(state.new_buf) and vim.api.nvim_buf_get_lines(state.new_buf, 0, -1, false) or {}
+  return {
+    path = file.path,
+    line = line,
+    new_line = line,
+    text = buffer_lines[line] or "",
+    context_before = buffer_lines[math.max(1, line - 1)],
+    context_after = buffer_lines[math.min(#buffer_lines, line + 1)],
+  }
+end
+
+local function visual_range()
+  local file = current_file()
+  if not file or not valid_buf(state.new_buf) then
+    return nil
+  end
+  local start_line = vim.fn.line("v")
+  local end_line = vim.fn.line(".")
+  if start_line > end_line then
+    start_line, end_line = end_line, start_line
+  end
+  local buffer_lines = vim.api.nvim_buf_get_lines(state.new_buf, 0, -1, false)
+  local lines = {}
+  for line = start_line, end_line do
+    lines[#lines + 1] = buffer_lines[line] or ""
+  end
+  return {
+    path = file.path,
+    line = start_line,
+    end_line = end_line,
+    new_line = start_line,
+    text = table.concat(lines, "\n"),
+    context_before = buffer_lines[math.max(1, start_line - 1)],
+    context_after = buffer_lines[math.min(#buffer_lines, end_line + 1)],
+  }
+end
+
+local function add_annotation(note, range)
+  range = range or current_range()
+  if not range or not range.path or not range.line then
+    vim.notify("Move onto a file line before annotating", vim.log.levels.WARN)
+    return nil
+  end
+  if not note or note == "" then
+    return nil
+  end
+
+  local key = annotation_key(range.path, range.line)
+  state.annotations[key] = state.annotations[key] or {}
+  local annotation = {
+    id = state.next_annotation_id,
+    path = range.path,
+    line = range.line,
+    end_line = range.end_line,
+    new_line = range.new_line,
+    text = range.text,
+    note = note,
+  }
+  if not annotation.anchor_text or annotation.anchor_text == "" then
+    annotation.anchor_text = range.text
+  end
+  annotation.anchor_context_before = range.context_before
+  annotation.anchor_context_after = range.context_after
+  state.next_annotation_id = state.next_annotation_id + 1
+  table.insert(state.annotations[key], annotation)
+  save_state()
+  render_list()
+  render_annotations()
+  return annotation
+end
+
+local function notes_for_current_line()
+  local range = current_range()
+  if not range then
+    return nil, nil
+  end
+
+  local exact_key = annotation_key(range.path, range.line)
+  if state.annotations[exact_key] and #state.annotations[exact_key] > 0 then
+    return exact_key, state.annotations[exact_key]
+  end
+
+  local best_key = nil
+  local best_line = nil
+  for key, notes in pairs(state.annotations) do
+    if #notes > 0 and key:sub(1, #range.path + 1) == range.path .. ":" then
+      local line = tonumber(key:match(":(%d+)$"))
+      if line and line <= range.line and (not best_line or line > best_line) then
+        best_key = key
+        best_line = line
+      end
+    end
+  end
+
+  if best_key then
+    return best_key, state.annotations[best_key]
+  end
+
+  return exact_key, nil
+end
+
+local function edit_current_annotation()
+  local _, notes = notes_for_current_line()
+  if not notes or #notes == 0 then
+    vim.notify("No review note on this line", vim.log.levels.WARN)
+    return
+  end
+  local note = notes[#notes]
+  vim.ui.input({ prompt = "Edit review note: ", default = note.note }, function(input)
+    if not input or input == "" then
+      return
+    end
+    note.note = input
+    save_state()
+    render_list()
+    render_annotations()
+  end)
+end
+
+local function delete_current_annotation()
+  local key, notes = notes_for_current_line()
+  if not key or not notes or #notes == 0 then
+    vim.notify("No review note on this line", vim.log.levels.WARN)
+    return
+  end
+  table.remove(notes, #notes)
+  if #notes == 0 then
+    state.annotations[key] = nil
+  end
+  save_state()
+  render_list()
+  render_annotations()
+end
+
+local function jump_annotation(direction)
+  local file = current_file()
+  if not file or not valid_win(state.new_win) then
+    return
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(state.new_win)[1]
+  local lines = {}
+  for key, notes in pairs(state.annotations) do
+    if #notes > 0 and key:sub(1, #file.path + 1) == file.path .. ":" then
+      local line = tonumber(key:match(":(%d+)$"))
+      if line then
+        table.insert(lines, line)
+      end
+    end
+  end
+  table.sort(lines)
+
+  local target = nil
+  for _, line in ipairs(lines) do
+    if direction > 0 and line > cursor then
+      target = line
+      break
+    elseif direction < 0 and line < cursor then
+      target = line
+    end
+  end
+  if target then
+    vim.api.nvim_win_set_cursor(state.new_win, { target, 0 })
+  end
+end
+
+local function toggle_comments()
+  state.comments_expanded = not state.comments_expanded
+  render_annotations()
+end
+
+local function set_quickfix()
+  local items = {}
+  for _, notes in pairs(state.annotations) do
+    for _, note in ipairs(notes) do
+      table.insert(items, {
+        filename = state.root .. "/" .. note.path,
+        lnum = note.line,
+        col = 1,
+        text = note.note,
+      })
+    end
+  end
+  vim.fn.setqflist({}, "r", { title = "Pi review notes", items = items })
+  vim.cmd("copen")
+end
+
+local function jump_hunk(direction)
+  local file = current_file()
+  if not file or not valid_win(state.new_win) then
+    return
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(state.new_win)[1]
+  local target = nil
+  for _, hunk in ipairs(file.hunks) do
+    local row = math.max(1, hunk.new_start)
+    if direction > 0 and row > cursor then
+      target = row
+      break
+    elseif direction < 0 and row < cursor then
+      target = row
+    end
+  end
+  if target then
+    vim.api.nvim_win_set_cursor(state.new_win, { target, 0 })
+  end
+end
+
+local function prompt_annotation(range)
+  vim.ui.input({ prompt = "Review note: " }, function(input)
+    add_annotation(input, range)
+  end)
+end
+
+local function map_review_buffer(buf)
+  local opts = { buffer = buf, nowait = true }
+  vim.keymap.set("n", "]f", function() select_file(state.file_index + 1) end, vim.tbl_extend("force", opts, { desc = "Next diff file" }))
+  vim.keymap.set("n", "[f", function() select_file(state.file_index - 1) end, vim.tbl_extend("force", opts, { desc = "Previous diff file" }))
+  vim.keymap.set("n", "]h", function() jump_hunk(1) end, vim.tbl_extend("force", opts, { desc = "Next diff hunk" }))
+  vim.keymap.set("n", "[h", function() jump_hunk(-1) end, vim.tbl_extend("force", opts, { desc = "Previous diff hunk" }))
+  vim.keymap.set("n", "a", function() prompt_annotation(current_range()) end, vim.tbl_extend("force", opts, { desc = "Annotate current line" }))
+  vim.keymap.set("n", "]c", function() jump_annotation(1) end, vim.tbl_extend("force", opts, { desc = "Next review note" }))
+  vim.keymap.set("n", "[c", function() jump_annotation(-1) end, vim.tbl_extend("force", opts, { desc = "Previous review note" }))
+  vim.keymap.set("n", "e", edit_current_annotation, vim.tbl_extend("force", opts, { desc = "Edit review note" }))
+  vim.keymap.set("n", "x", delete_current_annotation, vim.tbl_extend("force", opts, { desc = "Delete review note" }))
+  vim.keymap.set("n", "z", toggle_comments, vim.tbl_extend("force", opts, { desc = "Toggle review note cards" }))
+  vim.keymap.set("v", "a", function()
+    local range = visual_range()
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+    prompt_annotation(range)
+  end, vim.tbl_extend("force", opts, { desc = "Annotate selected lines" }))
+  vim.keymap.set("n", "c", M.pick, vim.tbl_extend("force", opts, { desc = "Change diff comparison" }))
+  vim.keymap.set("n", "Q", set_quickfix, vim.tbl_extend("force", opts, { desc = "Open review notes quickfix" }))
+  vim.keymap.set("n", "r", function() M.refresh() end, vim.tbl_extend("force", opts, { desc = "Refresh review diff" }))
+end
+
+local function map_list_buffer(buf)
+  local opts = { buffer = buf, nowait = true }
+  vim.keymap.set("n", "<CR>", function()
+    local row = vim.api.nvim_win_get_cursor(0)[1]
+    select_file(row - 1)
+    if valid_win(state.new_win) then
+      vim.api.nvim_set_current_win(state.new_win)
+    end
+  end, vim.tbl_extend("force", opts, { desc = "Open diff file" }))
+  vim.keymap.set("n", "j", function()
+    vim.cmd("normal! j")
+    local row = vim.api.nvim_win_get_cursor(0)[1]
+    if row > 1 then
+      select_file(row - 1)
+    end
+  end, opts)
+  vim.keymap.set("n", "k", function()
+    vim.cmd("normal! k")
+    local row = vim.api.nvim_win_get_cursor(0)[1]
+    if row > 1 then
+      select_file(row - 1)
+    end
+  end, opts)
+end
+
+local function create_scratch(name, filetype)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].readonly = true
+  vim.bo[buf].filetype = filetype or ""
+  vim.api.nvim_buf_set_name(buf, name)
+  return buf
+end
+
+local function empty_source_buf()
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.bo[buf].bufhidden = ""
+  vim.bo[buf].buftype = ""
+  vim.bo[buf].modifiable = true
+  return buf
+end
+
+local function close_stale_review_windows()
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if valid_win(win) then
+      local buf = vim.api.nvim_win_get_buf(win)
+      local name = vim.api.nvim_buf_get_name(buf)
+      if name:match("Pi Review") then
+        if #vim.api.nvim_list_wins() > 1 then
+          pcall(vim.api.nvim_win_close, win, true)
+        else
+          vim.api.nvim_win_set_buf(win, empty_source_buf())
+        end
+      end
+    end
+  end
+end
+
+local function restore_previous_source()
+  if valid_win(state.previous_win) then
+    if valid_buf(state.previous_buf) then
+      vim.api.nvim_win_set_buf(state.previous_win, state.previous_buf)
+    end
+    vim.api.nvim_set_current_win(state.previous_win)
+    return true
+  end
+  return false
+end
+
+local function close_extra_empty_buffers()
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    local buf = vim.api.nvim_win_get_buf(win)
+    if vim.api.nvim_buf_get_name(buf) == "" and vim.bo[buf].buftype == "" and not vim.bo[buf].modified and #vim.api.nvim_list_wins() > 1 then
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+  end
+end
+
+local function reset_review_windows()
+  clear_diff_windows()
+  close_stale_review_windows()
+  restore_previous_source()
+  close_extra_empty_buffers()
+  state.list_buf = nil
+  state.old_buf = nil
+  state.new_buf = nil
+  state.list_win = nil
+  state.old_win = nil
+  state.new_win = nil
+end
+
+local function ensure_editor_space(_width)
+  local win = source_win()
+  if win then
+    vim.api.nvim_set_current_win(win)
+    return
+  end
+
+  vim.cmd("topleft vnew")
+  local editor_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(editor_win, empty_source_buf())
+end
+
+local function ensure_windows()
+  local previous = source_win()
+  state.previous_win = previous
+  state.previous_buf = previous and vim.api.nvim_win_get_buf(previous) or nil
+  reset_review_windows()
+  ensure_editor_space()
+
+  state.old_buf = create_scratch("Pi Review OLD", "")
+  vim.api.nvim_win_set_buf(0, state.old_buf)
+  state.old_win = vim.api.nvim_get_current_win()
+
+  vim.cmd("rightbelow vsplit")
+  state.new_buf = create_scratch("Pi Review NEW", "")
+  vim.api.nvim_win_set_buf(0, state.new_buf)
+  state.new_win = vim.api.nvim_get_current_win()
+
+  vim.api.nvim_set_current_win(state.old_win)
+  vim.cmd("leftabove 28vsplit")
+  state.list_buf = create_scratch("Pi Review Files", "piovim-review-files")
+  vim.api.nvim_win_set_buf(0, state.list_buf)
+  state.list_win = vim.api.nvim_get_current_win()
+
+  map_list_buffer(state.list_buf)
+  map_review_buffer(state.old_buf)
+  map_review_buffer(state.new_buf)
+  vim.api.nvim_set_current_win(state.new_win)
+end
+
+function M.open(input)
+  state.root = git_root()
+  prune_old_state_files()
+  load_state(state.root)
+  local comparison = comparison_from(input or "", state.root)
+  local diff = git_output(comparison.args, state.root)
+  if comparison.include_untracked then
+    local extra = untracked_diff(state.root)
+    if extra ~= "" then
+      diff = diff ~= "" and (diff .. "\n" .. extra) or extra
+    end
+  end
+
+  state.comparison = comparison
+  state.files = parse_diff(diff)
+  if state.file_index > #state.files then
+    state.file_index = 1
+  end
+
+  ensure_windows()
+  render_list()
+  render_file()
+  M.resize_if_open()
+end
+
+function M.close()
+  reset_review_windows()
+  if not source_win() then
+    ensure_editor_space()
+  end
+end
+
+function M.refresh()
+  if not state.comparison then
+    return false
+  end
+
+  local selected_file = current_file()
+  local selected_path = selected_file and selected_file.path or nil
+  local input = state.comparison.input or ""
+
+  pcall(vim.cmd, "checktime")
+
+  state.root = state.root or git_root()
+  local comparison = comparison_from(input, state.root)
+  local diff = git_output(comparison.args, state.root)
+  if comparison.include_untracked then
+    local extra = untracked_diff(state.root)
+    if extra ~= "" then
+      diff = diff ~= "" and (diff .. "\n" .. extra) or extra
+    end
+  end
+
+  state.comparison = comparison
+  state.files = parse_diff(diff)
+  state.file_index = 1
+  if selected_path then
+    for index, file in ipairs(state.files) do
+      if file.path == selected_path then
+        state.file_index = index
+        break
+      end
+    end
+  end
+
+  render_list()
+  render_file()
+  return true
+end
+
+function M.refresh_if_open(path)
+  if not state.comparison or not valid_win(state.new_win) then
+    return false
+  end
+
+  if path then
+    local abs = vim.fn.fnamemodify(path, ":p")
+    local relevant = false
+    for _, file in ipairs(state.files) do
+      if vim.fn.fnamemodify(state.root .. "/" .. file.path, ":p") == abs then
+        relevant = true
+        break
+      end
+    end
+    if not relevant then
+      return false
+    end
+  end
+
+  return M.refresh()
+end
+
+function M.pick()
+  local choices = {
+    { label = "Working tree", value = "working-tree" },
+    { label = "Staged", value = "staged" },
+    { label = "Against main", value = "main" },
+    { label = "Against origin/main", value = "origin/main" },
+    { label = "Custom git diff args", value = "custom" },
+  }
+  vim.ui.select(choices, { prompt = "Pi review diff", format_item = function(item) return item.label end }, function(choice)
+    if not choice then
+      return
+    end
+    if choice.value == "custom" then
+      vim.ui.input({ prompt = "git diff args: " }, function(input)
+        if input then
+          M.open(input)
+        end
+      end)
+    else
+      M.open(choice.value)
+    end
+  end)
+end
+
+function M.add_annotation(params)
+  params = params or {}
+  return add_annotation(params.note, params.range)
+end
+
+function M.resolve_annotation(params)
+  params = params or {}
+  local id = tonumber(params.id)
+  local path = params.path
+  local line = tonumber(params.line)
+  local removed = nil
+
+  for key, notes in pairs(state.annotations) do
+    for index = #notes, 1, -1 do
+      local note = notes[index]
+      local matches_id = id and note.id == id
+      local matches_location = not id and path and line and note.path == path and note.line == line
+      if matches_id or matches_location then
+        removed = table.remove(notes, index)
+        if #notes == 0 then
+          state.annotations[key] = nil
+        end
+        save_state()
+        render_list()
+        render_annotations()
+        return { resolved = true, annotation = removed }
+      end
+    end
+  end
+
+  return { resolved = false }
+end
+
+function M.summary()
+  local lines = {
+    "Please apply the active Pi review diff notes.",
+    "",
+    "Instructions:",
+    "- Read the active review diff and annotations.",
+    "- Fix each annotation with minimal code changes.",
+    "- Prefer nvim_edit_buffer for files open in Neovim so the review diff refreshes live.",
+    "- Save edited buffers when the user explicitly asked for apply-fixes from the review flow.",
+    "- After fixing a note, call nvim_resolve_review_annotation with its id.",
+    "- Refresh/check the diff when done and report any unresolved notes.",
+    "",
+    "Review context:",
+    vim.json.encode(M.get_context()),
+  }
+  return table.concat(lines, "\n")
+end
+
+function M.get_context()
+  local file = current_file()
+  local range = current_range()
+  local annotations = {}
+  for _, notes in pairs(state.annotations) do
+    for _, note in ipairs(notes) do
+      table.insert(annotations, note)
+    end
+  end
+
+  local current_hunk = nil
+  if range and file then
+    for _, hunk in ipairs(file.hunks) do
+      local hunk_end = hunk.new_start + math.max(0, hunk.new_count - 1)
+      if range.line >= hunk.new_start and range.line <= hunk_end then
+        current_hunk = hunk
+        break
+      end
+    end
+  end
+
+  return {
+    root = state.root,
+    comparison = state.comparison and state.comparison.label or nil,
+    files = vim.tbl_map(function(item) return item.path end, state.files),
+    current_file = file and file.path or nil,
+    current_range = range,
+    current_hunk = current_hunk,
+    annotations = annotations,
+  }
+end
+
+local autocmds_ready = false
+local refresh_timer = nil
+
+local function schedule_refresh_for_path(path)
+  if not path or path == "" or not state.comparison or not valid_win(state.new_win) then
+    return
+  end
+
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local relevant = false
+  for _, file in ipairs(state.files) do
+    if vim.fn.fnamemodify(state.root .. "/" .. file.path, ":p") == abs then
+      relevant = true
+      break
+    end
+  end
+  if not relevant then
+    return
+  end
+
+  if refresh_timer then
+    refresh_timer:stop()
+  else
+    refresh_timer = vim.uv.new_timer()
+  end
+
+  refresh_timer:start(80, 0, function()
+    vim.schedule(function()
+      if state.comparison and valid_win(state.new_win) then
+        M.refresh()
+      end
+    end)
+  end)
+end
+
+local function setup_autocmds()
+  if autocmds_ready then
+    return
+  end
+  autocmds_ready = true
+
+  vim.api.nvim_create_autocmd({ "BufWritePost", "TextChanged", "TextChangedI" }, {
+    group = vim.api.nvim_create_augroup("piovim-review-diff", { clear = true }),
+    callback = function(event)
+      local ft = vim.bo[event.buf].filetype
+      if ft:match("^piovim%-") then
+        return
+      end
+      schedule_refresh_for_path(vim.api.nvim_buf_get_name(event.buf))
+    end,
+  })
+end
+
+function M.setup_commands()
+  setup_autocmds()
+  vim.api.nvim_create_user_command("PiovimReviewDiff", function(opts)
+    if opts.args == "" then
+      M.pick()
+    else
+      M.open(opts.args)
+    end
+  end, {
+    desc = "Open Pi review diff",
+    nargs = "*",
+    force = true,
+    complete = function()
+      return { "working-tree", "staged", "main", "origin/main" }
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufModifiedSet" }, {
+    group = vim.api.nvim_create_augroup("piovim-review-locks", { clear = true }),
+    pattern = "Pi Review*",
+    callback = function(event)
+      lock_review_buf(event.buf)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("BufWriteCmd", {
+    group = vim.api.nvim_create_augroup("piovim-review-write-guard", { clear = true }),
+    pattern = "Pi Review*",
+    callback = function()
+      vim.notify("Pi review buffers are read-only; edit the source file and refresh the diff", vim.log.levels.WARN)
+    end,
+  })
+
+  vim.api.nvim_create_user_command("PiovimReviewClose", M.close, { desc = "Close Pi review diff", force = true })
+  vim.api.nvim_create_user_command("PiovimReviewRefresh", M.refresh, { desc = "Refresh Pi review diff", force = true })
+  vim.api.nvim_create_user_command("PiovimReviewEditNote", edit_current_annotation, { desc = "Edit current Pi review note", force = true })
+  vim.api.nvim_create_user_command("PiovimReviewDeleteNote", delete_current_annotation, { desc = "Delete current Pi review note", force = true })
+  vim.api.nvim_create_user_command("PiovimReviewNotes", set_quickfix, { desc = "Open Pi review notes quickfix", force = true })
+end
+
+return M
