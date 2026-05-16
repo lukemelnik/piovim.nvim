@@ -93,7 +93,7 @@ Typed in the Piovim prompt:
 - `/clear` clears the current Pi session, visible chat, prompt, and highlights.
 - `/model` opens model selection.
 - `/thinking` opens thinking-level selection.
-- `/diff` opens the Pi review diff picker.
+- `/diff` opens the Pi review-source picker.
 - `/diff <args>` opens a Pi review diff with custom `git diff` args, e.g. `/diff main...HEAD`.
 - `/apply-fixes` asks Pi to fix active review notes and resolve them as it goes.
 
@@ -119,19 +119,25 @@ Mentions are intentionally plain text. Piovim does not paste selected code into 
 
 ## Review diff
 
-`:PiovimReviewDiff` opens a picker for common Git comparisons:
+`:PiovimReviewDiff` opens a review-source picker:
 
-- working tree (`git diff`)
-- staged (`git diff --cached`)
-- against `main` (`git diff main...HEAD`)
-- against `origin/main` (`git diff origin/main...HEAD`)
+- working tree (`git diff`, including untracked files)
+- staged changes (`git diff --cached`)
+- PR / branch comparison (`<base>...HEAD`)
+- recent commit picker (`git show <sha>`)
+- commit range (`git diff <range>`)
+- patch file (`*.patch` / unified diff text)
 - custom `git diff` args
+
+While a review is open, Piovim watches the active review source and refreshes when Git or patch-file contents change. Refreshes are deferred while you are typing or editing a review note so annotations are not interrupted.
 
 Inside the diff view:
 
 | Key | Action |
 | --- | --- |
 | `]f` / `[f` | Next / previous file |
+| `f` | Pick file without focusing the file-list pane |
+| `b` | Toggle the file-list pane |
 | `]h` / `[h` | Next / previous hunk |
 | `a` | Annotate current diff line |
 | visual `a` | Annotate selected diff lines |
@@ -227,6 +233,11 @@ Model/thinking settings are persisted at:
 - `:PiovimModelSelect`
 - `:PiovimModelCycle`
 - `:PiovimReviewDiff [working-tree|staged|main|origin/main|<git diff args>]`
+- `:PiovimReviewCommit [rev]`
+- `:PiovimReviewRange [range]`
+- `:PiovimReviewPatch [patch-file]`
+- `:PiovimReviewFiles`
+- `:PiovimReviewToggleFiles`
 - `:PiovimReviewClose`
 - `:PiovimReviewRefresh`
 - `:PiovimReviewEditNote`
