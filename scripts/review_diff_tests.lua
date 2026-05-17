@@ -30,6 +30,8 @@ local function test_normal_diff()
   assert_eq(#files[1].hunks, 1, "normal diff hunk count")
   assert_eq(files[1].patch_old_lines[2], "old", "normal diff old lines")
   assert_eq(files[1].patch_new_lines[2], "new", "normal diff new lines")
+  assert_eq(files[1].deleted_lines[1], 2, "normal diff deleted source line")
+  assert_eq(files[1].deleted_patch_rows[1], 2, "normal diff deleted patch row")
   assert_eq(T.file_status(files[1]), "M", "normal diff status")
 end
 
@@ -46,6 +48,20 @@ local function test_plain_unified_patch()
   assert_eq(files[1].old_path, "a.txt", "plain patch old path")
   assert_eq(files[1].patch_old_lines[1], "old", "plain patch old line")
   assert_eq(files[1].patch_new_lines[1], "new", "plain patch new line")
+end
+
+local function test_added_blank_line_tracking()
+  local files = T.parse_diff(table.concat({
+    "diff --git a/blank.txt b/blank.txt",
+    "index 1111111..2222222 100644",
+    "--- a/blank.txt",
+    "+++ b/blank.txt",
+    "@@ -1 +1,2 @@",
+    " hello",
+    "+",
+  }, "\n"))
+  assert_eq(files[1].added_blank_lines[1], 2, "added blank source line")
+  assert_eq(files[1].added_blank_patch_rows[1], 2, "added blank patch row")
 end
 
 local function test_deleted_file()
@@ -135,14 +151,43 @@ local function test_pr_source()
   local source = T.pr_source("123")
   assert_eq(source.kind, "pr", "pr source kind")
   assert_eq(source.label, "PR #123", "pr source label")
+  assert_eq(source.old_source, "patch", "pr old source uses patch lines")
+  assert_eq(source.new_source, "patch", "pr new source uses patch lines")
 
   local parsed = T.source_from("pr 123", ".")
   assert_eq(parsed.kind, "pr", "pr input parsed as pr source")
   assert_eq(parsed.input, "123", "pr input number")
 end
 
+local function test_source_materialization()
+  local working = T.source_from("", ".")
+  assert_eq(working.old_source, "index", "working tree old side should use index")
+  assert_eq(working.new_source, "worktree", "working tree new side should use worktree")
+
+  local custom = T.source_from("HEAD~1..HEAD -- lua/piovim/review_diff.lua", ".")
+  assert_eq(custom.old_source, "patch", "custom diff old side should use patch lines")
+  assert_eq(custom.new_source, "patch", "custom diff new side should use patch lines")
+
+  local range = T.range_source("HEAD~1..HEAD", ".")
+  assert_eq(range.old_source, "HEAD~1", "double-dot range old source")
+  assert_eq(range.new_source, "HEAD", "double-dot range new source")
+end
+
+local function test_state_paths_are_source_scoped()
+  local working = T.source_from("", ".")
+  local staged = T.source_from("staged", ".")
+  assert_true(T.state_path(".", working) ~= T.state_path(".", staged), "review state path should include source identity")
+end
+
+local function test_inactive_context()
+  local context = ReviewDiff.get_context()
+  assert_eq(context.active, false, "review context should start inactive")
+  assert_eq(#context.files, 0, "inactive review context should not expose stale files")
+end
+
 test_normal_diff()
 test_plain_unified_patch()
+test_added_blank_line_tracking()
 test_deleted_file()
 test_binary_file()
 test_rename_only_file()
@@ -150,5 +195,8 @@ test_mode_only_file()
 test_large_file_safeguard()
 test_split_args_with_quotes()
 test_pr_source()
+test_source_materialization()
+test_state_paths_are_source_scoped()
+test_inactive_context()
 
 print("review_diff_tests: ok")

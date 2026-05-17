@@ -27,6 +27,7 @@ local state = {
 }
 
 local ns = vim.api.nvim_create_namespace("piovim-review-diff")
+local diff_ns = vim.api.nvim_create_namespace("piovim-review-diff-lines")
 local state_version = 1
 local large_line_threshold = 5000
 local omit_line_threshold = 20000
@@ -71,8 +72,17 @@ local function repo_key(root)
   return vim.fn.sha256(root or "no-root"):sub(1, 16)
 end
 
-local function state_path(root)
-  return state_dir() .. "/" .. repo_key(root) .. ".json"
+local function source_identity(source)
+  if not source then
+    return "none"
+  end
+  local args = type(source.args) == "table" and table.concat(source.args, "\n--piovim-arg--\n") or ""
+  return table.concat({ source.kind or "", source.input or "", source.path or "", args }, "\n--piovim-source--\n")
+end
+
+local function state_path(root, source)
+  local key = repo_key(root) .. "-" .. vim.fn.sha256(source_identity(source)):sub(1, 16)
+  return state_dir() .. "/" .. key .. ".json"
 end
 
 local function ensure_state_dir()
@@ -91,32 +101,37 @@ local function prune_old_state_files()
 end
 
 local function save_state()
-  if not state.root then
+  local source = state.source or state.comparison
+  if not state.root or not source then
     return
   end
   ensure_state_dir()
   local payload = {
     version = state_version,
     root = state.root,
-    comparison_input = state.source and state.source.input or (state.comparison and state.comparison.input) or nil,
-    source = state.source,
+    source_identity = source_identity(source),
+    source = source,
     annotations = state.annotations,
     next_annotation_id = state.next_annotation_id,
     updated_at = os.time(),
   }
-  vim.fn.writefile({ vim.json.encode(payload) }, state_path(state.root))
+  vim.fn.writefile({ vim.json.encode(payload) }, state_path(state.root, source))
 end
 
-local function load_state(root)
+local function load_state(root, source)
   state.annotations = {}
   state.next_annotation_id = 1
+  if not source then
+    return
+  end
 
-  local path = state_path(root)
+  local identity = source_identity(source)
+  local path = state_path(root, source)
   if vim.fn.filereadable(path) ~= 1 then
     return
   end
   local ok, payload = pcall(vim.json.decode, table.concat(vim.fn.readfile(path), "\n"))
-  if not ok or type(payload) ~= "table" or payload.root ~= root then
+  if not ok or type(payload) ~= "table" or payload.root ~= root or payload.source_identity ~= identity then
     return
   end
   if type(payload.annotations) == "table" then
@@ -228,6 +243,17 @@ local function git_rev_parse(root, rev)
   return vim.trim(result.stdout or "")
 end
 
+local function git_merge_base(root, base, head)
+  if not base or not head then
+    return nil
+  end
+  local result = vim.system({ "git", "merge-base", base, head }, { cwd = root, text = true }):wait()
+  if result.code ~= 0 then
+    return nil
+  end
+  return vim.trim(result.stdout or "")
+end
+
 local pr_source
 
 local function source_from(input, root)
@@ -242,7 +268,7 @@ local function source_from(input, root)
       label = "working tree",
       input = input,
       args = { "diff", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" },
-      old_source = "HEAD",
+      old_source = "index",
       new_source = "worktree",
       include_untracked = true,
       watch = true,
@@ -273,15 +299,17 @@ local function source_from(input, root)
       label = ref .. "...HEAD",
       input = input,
       args = { "diff", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", ref .. "...HEAD" },
-      old_source = ref,
+      old_source = git_merge_base(root, ref, "HEAD") or ref,
       new_source = "HEAD",
+      watch_refs = { ref, "HEAD" },
+      merge_base_refs = { ref, "HEAD" },
       watch = true,
     }
   end
 
   local args = { "diff", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/" }
   vim.list_extend(args, split_args(input))
-  return { kind = "custom-diff", label = input, input = input, args = args, old_source = nil, new_source = "worktree", watch = true }
+  return { kind = "custom-diff", label = input, input = input, args = args, old_source = "patch", new_source = "patch", watch = true }
 end
 
 local function commit_source(rev, root)
@@ -303,9 +331,15 @@ local function range_source(range, root)
   if range == "" then
     range = default_base_ref(root) .. "...HEAD"
   end
-  local old_source, new_source = range:match("^(.+)%.%.%.(.+)$")
-  if not old_source then
-    old_source, new_source = range:match("^(.+)%.%.(.+)$")
+  local base, head = range:match("^(.+)%.%.%.(.+)$")
+  local is_triple_dot = base ~= nil
+  if not base then
+    base, head = range:match("^(.+)%.%.(.+)$")
+  end
+  local old_source = base
+  local new_source = head or "HEAD"
+  if is_triple_dot then
+    old_source = git_merge_base(root, base, new_source) or base
   end
   return {
     kind = "range",
@@ -313,7 +347,9 @@ local function range_source(range, root)
     input = range,
     args = { "diff", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", range },
     old_source = old_source,
-    new_source = new_source or "HEAD",
+    new_source = new_source,
+    watch_refs = base and { base, new_source } or { new_source },
+    merge_base_refs = is_triple_dot and { base, new_source } or nil,
     watch = true,
   }
 end
@@ -337,8 +373,8 @@ pr_source = function(number)
     kind = "pr",
     label = number == "" and "current branch PR" or ("PR #" .. number),
     input = number,
-    old_source = "PR base",
-    new_source = "PR head",
+    old_source = "patch",
+    new_source = "patch",
     watch = false,
   }
 end
@@ -352,6 +388,10 @@ local function new_file(path)
     hunks = {},
     patch_old_lines = nil,
     patch_new_lines = nil,
+    deleted_lines = {},
+    deleted_patch_rows = {},
+    added_blank_lines = {},
+    added_blank_patch_rows = {},
     metadata = {},
     binary = false,
     renamed = false,
@@ -423,6 +463,8 @@ local function parse_diff(text)
   local files = {}
   local file = nil
   local in_hunk = false
+  local hunk_old_line = nil
+  local hunk_new_line = nil
   local pending_old_path = nil
 
   for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
@@ -498,6 +540,8 @@ local function parse_diff(text)
       if hunk then
         table.insert(file.hunks, hunk)
         in_hunk = true
+        hunk_old_line = hunk.old_start
+        hunk_new_line = hunk.new_start
       elseif in_hunk then
         local marker = line:sub(1, 1)
         local body = line:sub(2)
@@ -508,18 +552,34 @@ local function parse_diff(text)
           if #file.patch_new_lines < omit_line_threshold then
             table.insert(file.patch_new_lines, body)
           end
+          hunk_old_line = hunk_old_line and hunk_old_line + 1 or nil
+          hunk_new_line = hunk_new_line and hunk_new_line + 1 or nil
         elseif marker == "-" then
+          if hunk_old_line then
+            table.insert(file.deleted_lines, hunk_old_line)
+          end
           if #file.patch_old_lines < omit_line_threshold then
             table.insert(file.patch_old_lines, body)
+            table.insert(file.deleted_patch_rows, #file.patch_old_lines)
           end
+          hunk_old_line = hunk_old_line and hunk_old_line + 1 or nil
         elseif marker == "+" then
+          if hunk_new_line and body == "" then
+            table.insert(file.added_blank_lines, hunk_new_line)
+          end
           if #file.patch_new_lines < omit_line_threshold then
             table.insert(file.patch_new_lines, body)
+            if body == "" then
+              table.insert(file.added_blank_patch_rows, #file.patch_new_lines)
+            end
           end
+          hunk_new_line = hunk_new_line and hunk_new_line + 1 or nil
         elseif line:match("^\\ No newline") then
           -- metadata line; ignore
         elseif line:match("^diff %-%-git ") then
           in_hunk = false
+          hunk_old_line = nil
+          hunk_new_line = nil
         end
         if #file.patch_old_lines >= omit_line_threshold or #file.patch_new_lines >= omit_line_threshold then
           file.omitted = true
@@ -691,6 +751,7 @@ local function setup_highlights()
   local border = vim.api.nvim_get_hl(0, { name = "FloatBorder", link = false })
   local hint = vim.api.nvim_get_hl(0, { name = "DiagnosticHint", link = false })
   local comment = vim.api.nvim_get_hl(0, { name = "Comment", link = false })
+  local delete = vim.api.nvim_get_hl(0, { name = "DiffDelete", link = false })
   local bg = float.bg or normal.bg
 
   vim.api.nvim_set_hl(0, "PiovimReviewComment", { default = true, fg = normal.fg, bg = bg })
@@ -698,6 +759,18 @@ local function setup_highlights()
   vim.api.nvim_set_hl(0, "PiovimReviewCommentHeader", { default = true, fg = hint.fg or normal.fg, bg = bg, bold = true })
   vim.api.nvim_set_hl(0, "PiovimReviewCommentMuted", { default = true, fg = comment.fg, bg = bg })
   vim.api.nvim_set_hl(0, "PiovimReviewCommentSpacer", { default = true, fg = bg, bg = bg })
+  vim.api.nvim_set_hl(0, "PiovimReviewPaneLabel", { default = true, fg = hint.fg or normal.fg, bg = bg, bold = true })
+  vim.api.nvim_set_hl(0, "PiovimReviewNoteHeader", { default = true, fg = hint.fg or normal.fg, bg = bg, bold = true })
+  vim.api.nvim_set_hl(0, "PiovimReviewNoteTarget", { default = true, link = "Visual" })
+  vim.api.nvim_set_hl(0, "PiovimReviewAddedBlank", { default = true, fg = hint.fg or comment.fg, bg = bg })
+  vim.api.nvim_set_hl(0, "PiovimReviewDeleted", {
+    default = true,
+    fg = delete.fg or normal.fg,
+    bg = delete.bg or bg,
+    bold = delete.bold,
+    italic = delete.italic,
+    underline = delete.underline,
+  })
 end
 
 local function lock_review_buf(buf)
@@ -713,6 +786,124 @@ local function set_buf_lines(buf, lines)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   lock_review_buf(buf)
+end
+
+local function replace_comma_option(value, prefix, replacement)
+  local parts = {}
+  for _, item in ipairs(vim.split(value or "", ",", { plain = true, trimempty = true })) do
+    if not item:match("^" .. vim.pesc(prefix)) then
+      table.insert(parts, item)
+    end
+  end
+  table.insert(parts, replacement)
+  return table.concat(parts, ",")
+end
+
+local function quiet_diff_fillers(win)
+  if not valid_win(win) then
+    return
+  end
+  vim.wo[win].fillchars = replace_comma_option(vim.wo[win].fillchars, "diff:", "diff: ")
+  vim.wo[win].winhighlight = replace_comma_option(vim.wo[win].winhighlight, "DiffDelete:", "DiffDelete:Normal")
+end
+
+local function source_name(raw)
+  if not raw or raw == "" then
+    return "patch"
+  end
+  if raw:match("^%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x$") then
+    return raw:sub(1, 12)
+  end
+  return raw
+end
+
+local function pane_source_label(side)
+  local comparison = state.comparison or {}
+  if side == "old" and comparison.merge_base_refs then
+    return "merge-base " .. source_name(comparison.merge_base_refs[1])
+  end
+  return source_name(side == "old" and comparison.old_source or comparison.new_source)
+end
+
+local function statusline_escape(text)
+  return tostring(text or ""):gsub("%%", "%%%%")
+end
+
+local function pane_label(side, file)
+  local name = side == "old" and "OLD" or "NEW"
+  local path = file and (side == "old" and file.old_path or file.path) or nil
+  local label = name .. " · " .. pane_source_label(side)
+  if path and path ~= "" then
+    label = label .. " · " .. path
+  end
+  return "%#PiovimReviewPaneLabel# " .. statusline_escape(label) .. " %*"
+end
+
+local function apply_pane_labels(file)
+  setup_highlights()
+  if valid_win(state.old_win) then
+    vim.wo[state.old_win].winbar = pane_label("old", file)
+  end
+  if valid_win(state.new_win) then
+    vim.wo[state.new_win].winbar = pane_label("new", file)
+  end
+end
+
+local function clear_pane_labels()
+  if valid_win(state.old_win) then
+    vim.wo[state.old_win].winbar = ""
+  end
+  if valid_win(state.new_win) then
+    vim.wo[state.new_win].winbar = ""
+  end
+end
+
+local function deleted_rows_for(file)
+  local comparison = state.comparison or {}
+  if comparison.kind == "patch" or comparison.old_source == "patch" or not comparison.old_source then
+    return file.deleted_patch_rows or {}
+  end
+  return file.deleted_lines or {}
+end
+
+local function added_blank_rows_for(file)
+  local comparison = state.comparison or {}
+  if comparison.kind == "patch" or comparison.new_source == "patch" or not comparison.new_source then
+    return file.added_blank_patch_rows or {}
+  end
+  return file.added_blank_lines or {}
+end
+
+local function style_diff_lines(file)
+  setup_highlights()
+  quiet_diff_fillers(state.old_win)
+  quiet_diff_fillers(state.new_win)
+
+  if valid_buf(state.old_buf) then
+    vim.api.nvim_buf_clear_namespace(state.old_buf, diff_ns, 0, -1)
+    local line_count = vim.api.nvim_buf_line_count(state.old_buf)
+    for _, line in ipairs(deleted_rows_for(file)) do
+      if line > 0 and line <= line_count then
+        vim.api.nvim_buf_set_extmark(state.old_buf, diff_ns, line - 1, 0, {
+          line_hl_group = "PiovimReviewDeleted",
+          priority = 130,
+        })
+      end
+    end
+  end
+  if valid_buf(state.new_buf) then
+    vim.api.nvim_buf_clear_namespace(state.new_buf, diff_ns, 0, -1)
+    local line_count = vim.api.nvim_buf_line_count(state.new_buf)
+    for _, line in ipairs(added_blank_rows_for(file)) do
+      if line > 0 and line <= line_count then
+        vim.api.nvim_buf_set_extmark(state.new_buf, diff_ns, line - 1, 0, {
+          virt_text = { { "+", "PiovimReviewAddedBlank" } },
+          virt_text_pos = "overlay",
+          priority = 140,
+        })
+      end
+    end
+  end
 end
 
 local function filetype_for(path)
@@ -818,6 +1009,12 @@ side_lines = function(file, side)
     if file.old_null then
       return {}
     end
+    if comparison.old_source == "patch" or not comparison.old_source then
+      return apply_large_safeguard(file, side, file.patch_old_lines or {})
+    elseif comparison.old_source == "index" then
+      return apply_large_safeguard(file, side, read_index_file(state.root, file.old_path))
+    end
+
     local lines = read_git_file(state.root, comparison.old_source, file.old_path)
     if #lines > 0 then
       return apply_large_safeguard(file, side, lines)
@@ -828,18 +1025,17 @@ side_lines = function(file, side)
   if file.new_null then
     return {}
   end
-  if comparison.new_source == "index" then
+  if comparison.new_source == "patch" or not comparison.new_source then
+    return apply_large_safeguard(file, side, file.patch_new_lines or {})
+  elseif comparison.new_source == "index" then
     return apply_large_safeguard(file, side, read_index_file(state.root, file.path))
   elseif comparison.new_source == "HEAD" then
     return apply_large_safeguard(file, side, read_git_file(state.root, "HEAD", file.path))
-  elseif comparison.new_source and comparison.new_source ~= "worktree" and comparison.new_source ~= "patch" then
+  elseif comparison.new_source ~= "worktree" then
     local lines = read_git_file(state.root, comparison.new_source, file.path)
     if #lines > 0 then
       return apply_large_safeguard(file, side, lines)
     end
-  end
-  if comparison.new_source == "patch" then
-    return apply_large_safeguard(file, side, file.patch_new_lines or {})
   end
   return apply_large_safeguard(file, side, read_worktree_file(state.root, file.path))
 end
@@ -1037,6 +1233,9 @@ local function render_annotations()
   end
 end
 
+local map_review_buffer
+local select_file
+
 function M.resize_if_open()
   if not (valid_win(state.old_win) and valid_win(state.new_win)) then
     return false
@@ -1078,6 +1277,10 @@ local function render_file()
   local ft = filetype_for(file.path)
   vim.bo[state.old_buf].filetype = ft
   vim.bo[state.new_buf].filetype = ft
+  if map_review_buffer then
+    map_review_buffer(state.old_buf)
+    map_review_buffer(state.new_buf)
+  end
   vim.api.nvim_buf_set_name(state.old_buf, "Pi Review OLD: " .. file.old_path)
   vim.api.nvim_buf_set_name(state.new_buf, "Pi Review NEW: " .. file.path)
 
@@ -1090,6 +1293,8 @@ local function render_file()
       vim.api.nvim_set_current_win(state.new_win)
       vim.cmd("diffthis")
     end
+    apply_pane_labels(file)
+    style_diff_lines(file)
   end
 
   local first_hunk = file.hunks[1]
@@ -1106,7 +1311,7 @@ local function render_file()
   end
 end
 
-local function select_file(index)
+select_file = function(index)
   if #state.files == 0 then
     return
   end
@@ -1310,6 +1515,303 @@ local function set_quickfix()
   vim.cmd("copen")
 end
 
+local function annotation_items()
+  local items = {}
+  for key, notes in pairs(state.annotations) do
+    for index, note in ipairs(notes) do
+      table.insert(items, {
+        key = key,
+        index = index,
+        note = note,
+        path = note.path,
+        line = tonumber(note.line) or 1,
+      })
+    end
+  end
+  table.sort(items, function(a, b)
+    if a.path == b.path then
+      if a.line == b.line then
+        return (a.note.id or 0) < (b.note.id or 0)
+      end
+      return a.line < b.line
+    end
+    return tostring(a.path) < tostring(b.path)
+  end)
+  return items
+end
+
+local function file_index_for_path(path)
+  for index, file in ipairs(state.files) do
+    if file.path == path or file.old_path == path then
+      return index, file
+    end
+  end
+  return nil, nil
+end
+
+local function note_context(note)
+  local _, file = file_index_for_path(note.path)
+  local lines = file and side_lines(file, "new") or {}
+  local line = math.max(1, tonumber(note.line) or 1)
+  local start_line = math.max(1, line - 3)
+  local end_line = math.min(#lines, line + 3)
+  local source_lines = {}
+
+  if #lines == 0 then
+    source_lines = { "No source context available for this note." }
+    start_line = 1
+    line = 1
+  else
+    for row = start_line, end_line do
+      table.insert(source_lines, lines[row] or "")
+    end
+  end
+
+  return {
+    header = "Note #" .. tostring(note.id or "?") .. " · " .. tostring(note.path or "") .. ":" .. tostring(line),
+    note = note.note or "",
+    lines = source_lines,
+    start_line = start_line,
+    target_row = math.max(1, line - start_line + 1),
+    filetype = file and filetype_for(file.path) or "text",
+  }
+end
+
+local function jump_to_annotation(note)
+  local index = file_index_for_path(note.path)
+  if index then
+    select_file(index)
+  end
+  if valid_win(state.new_win) then
+    vim.api.nvim_set_current_win(state.new_win)
+    local line_count = valid_buf(state.new_buf) and vim.api.nvim_buf_line_count(state.new_buf) or 1
+    local line = math.max(1, math.min(line_count, tonumber(note.line) or 1))
+    pcall(vim.api.nvim_win_set_cursor, state.new_win, { line, 0 })
+    vim.cmd("normal! zv")
+  end
+end
+
+local function open_notes_picker()
+  local items = annotation_items()
+  if #items == 0 then
+    vim.notify("No Pi review notes", vim.log.levels.INFO)
+    return
+  end
+
+  local width = math.min(math.max(84, math.floor(vim.o.columns * 0.78)), math.max(20, vim.o.columns - 4))
+  local height = math.min(math.max(12, math.floor(vim.o.lines * 0.55)), math.max(4, vim.o.lines - 4))
+  local list_width = math.min(math.max(24, math.floor(width * 0.42)), math.max(20, width - 25))
+  local preview_width = math.max(20, width - list_width - 1)
+  local row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1)
+  local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+  local selected = 1
+
+  local list_buf = vim.api.nvim_create_buf(false, true)
+  local preview_buf = vim.api.nvim_create_buf(false, true)
+  for _, buf in ipairs({ list_buf, preview_buf }) do
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].swapfile = false
+    vim.bo[buf].filetype = "piovim-review-notes"
+  end
+
+  local list_win = vim.api.nvim_open_win(list_buf, true, {
+    relative = "editor",
+    row = row,
+    col = col,
+    width = list_width,
+    height = height,
+    border = "rounded",
+    title = " Pi review notes ",
+    style = "minimal",
+  })
+  local preview_win = vim.api.nvim_open_win(preview_buf, false, {
+    relative = "editor",
+    row = row,
+    col = col + list_width + 1,
+    width = preview_width,
+    height = height,
+    border = "rounded",
+    title = " Context ",
+    style = "minimal",
+  })
+
+  local function close()
+    if valid_win(preview_win) then
+      vim.api.nvim_win_close(preview_win, true)
+    end
+    if valid_win(list_win) then
+      vim.api.nvim_win_close(list_win, true)
+    elseif valid_buf(list_buf) then
+      vim.api.nvim_buf_delete(list_buf, { force = true })
+    end
+  end
+
+  local function set_lines(buf, lines)
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+  end
+
+  local function add_inline_prefix(buf, row, text, hl_group)
+    local ok = pcall(vim.api.nvim_buf_set_extmark, buf, ns, row, 0, {
+      virt_text = { { text, hl_group } },
+      virt_text_pos = "inline",
+      priority = 150,
+    })
+    if not ok then
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns, row, 0, {
+        virt_text = { { text, hl_group } },
+        virt_text_pos = "eol",
+        priority = 150,
+      })
+    end
+  end
+
+  local function render_preview()
+    local item = items[selected]
+    if not item then
+      vim.bo[preview_buf].filetype = "text"
+      set_lines(preview_buf, { "No review note selected." })
+      return
+    end
+
+    local context = note_context(item.note)
+    vim.api.nvim_buf_clear_namespace(preview_buf, ns, 0, -1)
+    vim.bo[preview_buf].filetype = context.filetype ~= "" and context.filetype or "text"
+    vim.bo[preview_buf].syntax = vim.bo[preview_buf].filetype
+    pcall(vim.treesitter.start, preview_buf, vim.bo[preview_buf].filetype)
+    set_lines(preview_buf, context.lines)
+
+    local header_lines = {
+      { { context.header, "PiovimReviewNoteHeader" } },
+      { { "Full note", "PiovimReviewCommentMuted" } },
+    }
+    for _, line in ipairs(wrap_text(context.note, math.max(24, preview_width - 4))) do
+      table.insert(header_lines, { { line, "PiovimReviewComment" } })
+    end
+    vim.api.nvim_buf_set_extmark(preview_buf, ns, 0, 0, {
+      virt_lines = header_lines,
+      virt_lines_above = true,
+      priority = 150,
+    })
+
+    for index = 1, #context.lines do
+      local source_line = context.start_line + index - 1
+      local marker = index == context.target_row and "▸" or " "
+      add_inline_prefix(preview_buf, index - 1, string.format("%s %4d  ", marker, source_line), "LineNr")
+    end
+    if context.target_row >= 1 and context.target_row <= #context.lines then
+      vim.api.nvim_buf_set_extmark(preview_buf, ns, context.target_row - 1, 0, {
+        line_hl_group = "PiovimReviewNoteTarget",
+        priority = 120,
+      })
+      if valid_win(preview_win) then
+        pcall(vim.api.nvim_win_set_cursor, preview_win, { 1, 0 })
+      end
+    end
+  end
+
+  local function render_list()
+    vim.api.nvim_buf_clear_namespace(list_buf, ns, 0, -1)
+    local lines = {}
+    local selected_row = 1
+    for index, item in ipairs(items) do
+      local prefix = index == selected and "▸ " or "  "
+      if index == selected then
+        selected_row = #lines + 1
+      end
+      table.insert(lines, prefix .. tostring(item.path) .. ":" .. tostring(item.line))
+      if index == selected then
+        local note_lines = wrap_text(item.note.note or "", math.max(18, list_width - 4))
+        if #note_lines == 0 then
+          note_lines = { "" }
+        end
+        for _, note_line in ipairs(note_lines) do
+          table.insert(lines, "    " .. note_line)
+        end
+      end
+    end
+    set_lines(list_buf, lines)
+    if #lines > 0 then
+      vim.api.nvim_buf_set_extmark(list_buf, ns, selected_row - 1, 0, {
+        line_hl_group = "Visual",
+        priority = 120,
+      })
+      if valid_win(list_win) then
+        pcall(vim.api.nvim_win_set_cursor, list_win, { selected_row, 0 })
+      end
+    end
+    render_preview()
+  end
+
+  local function refresh_items()
+    items = annotation_items()
+    if #items == 0 then
+      close()
+      vim.notify("No Pi review notes", vim.log.levels.INFO)
+      return false
+    end
+    selected = math.max(1, math.min(selected, #items))
+    render_list()
+    return true
+  end
+
+  local function move(delta)
+    if #items == 0 then
+      return
+    end
+    selected = math.max(1, math.min(#items, selected + delta))
+    render_list()
+  end
+
+  local function edit_selected()
+    local item = items[selected]
+    if not item then
+      return
+    end
+    vim.ui.input({ prompt = "Edit review note: ", default = item.note.note }, function(input)
+      if not input or input == "" then
+        return
+      end
+      item.note.note = input
+      save_state()
+      render_list()
+      render_annotations()
+    end)
+  end
+
+  local function delete_selected()
+    local item = items[selected]
+    if not item then
+      return
+    end
+    M.resolve_annotation({ id = item.note.id })
+    refresh_items()
+  end
+
+  local function jump_selected()
+    local item = items[selected]
+    if not item then
+      return
+    end
+    close()
+    jump_to_annotation(item.note)
+  end
+
+  render_list()
+  local opts = { buffer = list_buf, nowait = true }
+  vim.keymap.set("n", "j", function() move(1) end, vim.tbl_extend("force", opts, { desc = "Next review note" }))
+  vim.keymap.set("n", "k", function() move(-1) end, vim.tbl_extend("force", opts, { desc = "Previous review note" }))
+  vim.keymap.set("n", "<Down>", function() move(1) end, opts)
+  vim.keymap.set("n", "<Up>", function() move(-1) end, opts)
+  vim.keymap.set("n", "<CR>", jump_selected, vim.tbl_extend("force", opts, { desc = "Jump to review note" }))
+  vim.keymap.set("n", "e", edit_selected, vim.tbl_extend("force", opts, { desc = "Edit review note" }))
+  vim.keymap.set("n", "x", delete_selected, vim.tbl_extend("force", opts, { desc = "Delete review note" }))
+  vim.keymap.set("n", "q", close, vim.tbl_extend("force", opts, { desc = "Close review notes" }))
+  vim.keymap.set("n", "<Esc>", close, vim.tbl_extend("force", opts, { desc = "Close review notes" }))
+end
+
 local function jump_hunk(direction)
   local file = current_file()
   if not file or not valid_win(state.new_win) then
@@ -1335,6 +1837,77 @@ end
 local create_scratch
 local map_list_buffer
 
+local function show_shortcuts_help()
+  local lines = {
+    "Pi review shortcuts",
+    "",
+    "Files",
+    "  ]f / [f    next / previous file from any review pane",
+    "  f          pick file with preview",
+    "  b          toggle file list",
+    "  Enter      open selected file from file list",
+    "  j / k      move in file list and preview file",
+    "",
+    "Hunks and comments",
+    "  ]h / [h    next / previous hunk from any review pane",
+    "  J / K      next / previous hunk fallback",
+    "  a          comment on current diff line",
+    "  visual a   comment on selected diff lines",
+    "  ]c / [c    next / previous comment",
+    "  C / X      next / previous comment fallback",
+    "  e          edit current/nearest comment",
+    "  x          delete current/nearest comment",
+    "  z          toggle compact/expanded comments",
+    "  c          browse all comments with context",
+    "",
+    "Review actions",
+    "  s          change source/comparison",
+    "  Q          open review notes in quickfix",
+    "  r          refresh current comparison",
+    "  ?          show this help",
+    "  q / Esc    close this help",
+  }
+
+  local width = 0
+  for _, line in ipairs(lines) do
+    width = math.max(width, #line)
+  end
+  local available_width = math.max(20, vim.o.columns - 4)
+  local available_height = math.max(4, vim.o.lines - 4)
+  width = math.min(math.max(width + 4, 46), available_width)
+  local height = math.min(#lines, math.max(4, available_height))
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "piovim-review-help"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1),
+    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+    width = width,
+    height = height,
+    border = "rounded",
+    title = " Pi review help ",
+    style = "minimal",
+  })
+  vim.api.nvim_buf_add_highlight(buf, ns, "Title", 0, 0, -1)
+
+  local function close()
+    if valid_win(win) then
+      vim.api.nvim_win_close(win, true)
+    elseif valid_buf(buf) then
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end
+  end
+  for _, key in ipairs({ "q", "?", "<Esc>" }) do
+    vim.keymap.set("n", key, close, { buffer = buf, nowait = true, desc = "Close Pi review help" })
+  end
+end
+
 local function prompt_annotation(range)
   tracked_input({ prompt = "Review note: " }, function(input)
     add_annotation(input, range)
@@ -1352,29 +1925,194 @@ local function note_count_for_file(path)
 end
 
 local function pick_file()
-  local choices = {}
-  for index, file in ipairs(state.files) do
-    local note_count = note_count_for_file(file.path)
-    local suffix = note_count > 0 and ("  (" .. note_count .. ")") or ""
-    local badge = file.omitted and " !" or (file.large and " ~" or "")
-    table.insert(choices, {
-      index = index,
-      label = file.path .. "  " .. file_status(file) .. badge .. suffix,
-    })
-  end
-  if #choices == 0 then
+  if #state.files == 0 then
     vim.notify("No files in current review", vim.log.levels.INFO)
     return
   end
-  vim.ui.select(choices, { prompt = "Pi review file", format_item = function(item) return item.label end }, function(choice)
-    if not choice then
+
+  local width = math.min(math.max(92, math.floor(vim.o.columns * 0.82)), math.max(20, vim.o.columns - 4))
+  local height = math.min(math.max(14, math.floor(vim.o.lines * 0.62)), math.max(4, vim.o.lines - 4))
+  local list_width = math.min(math.max(30, math.floor(width * 0.42)), math.max(20, width - 25))
+  local preview_width = math.max(20, width - list_width - 1)
+  local row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1)
+  local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+  local selected = math.max(1, math.min(state.file_index, #state.files))
+
+  local list_buf = vim.api.nvim_create_buf(false, true)
+  local preview_buf = vim.api.nvim_create_buf(false, true)
+  for _, buf in ipairs({ list_buf, preview_buf }) do
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].swapfile = false
+  end
+  vim.bo[list_buf].filetype = "piovim-review-file-picker"
+
+  local list_win = vim.api.nvim_open_win(list_buf, true, {
+    relative = "editor",
+    row = row,
+    col = col,
+    width = list_width,
+    height = height,
+    border = "rounded",
+    title = " Review files ",
+    style = "minimal",
+  })
+  local preview_win = vim.api.nvim_open_win(preview_buf, false, {
+    relative = "editor",
+    row = row,
+    col = col + list_width + 1,
+    width = preview_width,
+    height = height,
+    border = "rounded",
+    title = " Preview ",
+    style = "minimal",
+  })
+  vim.wo[list_win].cursorline = true
+  vim.wo[preview_win].number = false
+  vim.wo[preview_win].relativenumber = false
+  vim.wo[preview_win].wrap = false
+
+  local function close()
+    if valid_win(preview_win) then
+      vim.api.nvim_win_close(preview_win, true)
+    end
+    if valid_win(list_win) then
+      vim.api.nvim_win_close(list_win, true)
+    elseif valid_buf(list_buf) then
+      vim.api.nvim_buf_delete(list_buf, { force = true })
+    end
+  end
+
+  local function set_lines(buf, lines)
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+  end
+
+  local function add_inline_prefix(buf, line, text, hl_group)
+    local ok = pcall(vim.api.nvim_buf_set_extmark, buf, ns, line, 0, {
+      virt_text = { { text, hl_group } },
+      virt_text_pos = "inline",
+      priority = 150,
+    })
+    if not ok then
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns, line, 0, {
+        virt_text = { { text, hl_group } },
+        virt_text_pos = "eol",
+        priority = 150,
+      })
+    end
+  end
+
+  local function file_label(file)
+    local note_count = note_count_for_file(file.path)
+    local suffix = note_count > 0 and ("  (" .. note_count .. " note" .. (note_count == 1 and "" or "s") .. ")") or ""
+    local badge = file.omitted and " !" or (file.large and " ~" or "")
+    return file.path .. "  " .. file_status(file) .. badge .. suffix
+  end
+
+  local function render_preview()
+    local file = state.files[selected]
+    if not file then
+      vim.bo[preview_buf].filetype = "text"
+      set_lines(preview_buf, { "No file selected." })
       return
     end
-    select_file(choice.index)
+
+    vim.api.nvim_buf_clear_namespace(preview_buf, ns, 0, -1)
+    local ft = filetype_for(file.path)
+    vim.bo[preview_buf].filetype = ft ~= "" and ft or "text"
+    vim.bo[preview_buf].syntax = vim.bo[preview_buf].filetype
+    pcall(vim.treesitter.start, preview_buf, vim.bo[preview_buf].filetype)
+
+    local lines = side_lines(file, "new")
+    if #lines == 0 then
+      lines = { "No new-side content for this file." }
+    end
+    set_lines(preview_buf, lines)
+    if valid_win(preview_win) then
+      vim.api.nvim_win_set_config(preview_win, { title = " " .. file.path .. " " })
+      pcall(vim.api.nvim_win_set_cursor, preview_win, { 1, 0 })
+    end
+
+    local first_hunk = file.hunks[1]
+    local target = first_hunk and math.max(1, math.min(#lines, first_hunk.new_start)) or 1
+    for index = 1, #lines do
+      local marker = index == target and "▸" or " "
+      add_inline_prefix(preview_buf, index - 1, string.format("%s %4d  ", marker, index), "LineNr")
+    end
+    if target >= 1 and target <= #lines then
+      vim.api.nvim_buf_set_extmark(preview_buf, ns, target - 1, 0, {
+        line_hl_group = "PiovimReviewNoteTarget",
+        priority = 120,
+      })
+      if valid_win(preview_win) then
+        pcall(vim.api.nvim_win_set_cursor, preview_win, { target, 0 })
+      end
+    end
+  end
+
+  local function render_list()
+    vim.api.nvim_buf_clear_namespace(list_buf, ns, 0, -1)
+    local lines = {}
+    for index, file in ipairs(state.files) do
+      local icon, icon_hl = file_icon(file.path)
+      local label = file_label(file)
+      if #label > list_width - 6 then
+        label = label:sub(1, math.max(1, list_width - 7)) .. "…"
+      end
+      local prefix = index == selected and "▸ " or "  "
+      table.insert(lines, prefix .. icon .. " " .. label)
+      if icon_hl ~= "" then
+        vim.schedule(function()
+          if valid_buf(list_buf) then
+            pcall(vim.api.nvim_buf_set_extmark, list_buf, ns, index - 1, #prefix, {
+              end_col = #prefix + #icon,
+              hl_group = icon_hl,
+              priority = 130,
+            })
+          end
+        end)
+      end
+    end
+    set_lines(list_buf, lines)
+    if #lines > 0 then
+      vim.api.nvim_buf_set_extmark(list_buf, ns, selected - 1, 0, {
+        line_hl_group = "Visual",
+        priority = 120,
+      })
+      if valid_win(list_win) then
+        pcall(vim.api.nvim_win_set_cursor, list_win, { selected, 0 })
+      end
+    end
+    render_preview()
+  end
+
+  local function move(delta)
+    selected = math.max(1, math.min(#state.files, selected + delta))
+    render_list()
+  end
+
+  local function accept()
+    local index = selected
+    close()
+    select_file(index)
     if valid_win(state.new_win) then
       vim.api.nvim_set_current_win(state.new_win)
     end
-  end)
+  end
+
+  render_list()
+  local opts = { buffer = list_buf, nowait = true }
+  vim.keymap.set("n", "j", function() move(1) end, vim.tbl_extend("force", opts, { desc = "Next review file" }))
+  vim.keymap.set("n", "k", function() move(-1) end, vim.tbl_extend("force", opts, { desc = "Previous review file" }))
+  vim.keymap.set("n", "<Down>", function() move(1) end, opts)
+  vim.keymap.set("n", "<Up>", function() move(-1) end, opts)
+  vim.keymap.set("n", "]f", function() move(1) end, vim.tbl_extend("force", opts, { desc = "Next review file" }))
+  vim.keymap.set("n", "[f", function() move(-1) end, vim.tbl_extend("force", opts, { desc = "Previous review file" }))
+  vim.keymap.set("n", "<CR>", accept, vim.tbl_extend("force", opts, { desc = "Open review file" }))
+  vim.keymap.set("n", "q", close, vim.tbl_extend("force", opts, { desc = "Close review file picker" }))
+  vim.keymap.set("n", "<Esc>", close, vim.tbl_extend("force", opts, { desc = "Close review file picker" }))
 end
 
 local function toggle_file_list()
@@ -1405,15 +2143,19 @@ local function toggle_file_list()
   end
 end
 
-local function map_review_buffer(buf)
+map_review_buffer = function(buf)
   local opts = { buffer = buf, nowait = true }
   vim.keymap.set("n", "]f", function() select_file(state.file_index + 1) end, vim.tbl_extend("force", opts, { desc = "Next diff file" }))
   vim.keymap.set("n", "[f", function() select_file(state.file_index - 1) end, vim.tbl_extend("force", opts, { desc = "Previous diff file" }))
   vim.keymap.set("n", "]h", function() jump_hunk(1) end, vim.tbl_extend("force", opts, { desc = "Next diff hunk" }))
   vim.keymap.set("n", "[h", function() jump_hunk(-1) end, vim.tbl_extend("force", opts, { desc = "Previous diff hunk" }))
+  vim.keymap.set("n", "J", function() jump_hunk(1) end, vim.tbl_extend("force", opts, { desc = "Next diff hunk" }))
+  vim.keymap.set("n", "K", function() jump_hunk(-1) end, vim.tbl_extend("force", opts, { desc = "Previous diff hunk" }))
   vim.keymap.set("n", "a", function() prompt_annotation(current_range()) end, vim.tbl_extend("force", opts, { desc = "Annotate current line" }))
   vim.keymap.set("n", "]c", function() jump_annotation(1) end, vim.tbl_extend("force", opts, { desc = "Next review note" }))
   vim.keymap.set("n", "[c", function() jump_annotation(-1) end, vim.tbl_extend("force", opts, { desc = "Previous review note" }))
+  vim.keymap.set("n", "C", function() jump_annotation(1) end, vim.tbl_extend("force", opts, { desc = "Next review note" }))
+  vim.keymap.set("n", "X", function() jump_annotation(-1) end, vim.tbl_extend("force", opts, { desc = "Previous review note" }))
   vim.keymap.set("n", "e", edit_current_annotation, vim.tbl_extend("force", opts, { desc = "Edit review note" }))
   vim.keymap.set("n", "x", delete_current_annotation, vim.tbl_extend("force", opts, { desc = "Delete review note" }))
   vim.keymap.set("n", "z", toggle_comments, vim.tbl_extend("force", opts, { desc = "Toggle review note cards" }))
@@ -1424,9 +2166,11 @@ local function map_review_buffer(buf)
   end, vim.tbl_extend("force", opts, { desc = "Annotate selected lines" }))
   vim.keymap.set("n", "f", pick_file, vim.tbl_extend("force", opts, { desc = "Pick diff file" }))
   vim.keymap.set("n", "b", toggle_file_list, vim.tbl_extend("force", opts, { desc = "Toggle file list" }))
-  vim.keymap.set("n", "c", M.pick, vim.tbl_extend("force", opts, { desc = "Change diff comparison" }))
-  vim.keymap.set("n", "Q", set_quickfix, vim.tbl_extend("force", opts, { desc = "Open review notes quickfix" }))
+  vim.keymap.set("n", "c", open_notes_picker, vim.tbl_extend("force", opts, { desc = "Browse review comments" }))
+  vim.keymap.set("n", "s", M.pick, vim.tbl_extend("force", opts, { desc = "Change review source" }))
+  vim.keymap.set("n", "Q", set_quickfix, vim.tbl_extend("force", opts, { desc = "Open review comments quickfix" }))
   vim.keymap.set("n", "r", function() M.refresh() end, vim.tbl_extend("force", opts, { desc = "Refresh review diff" }))
+  vim.keymap.set("n", "?", show_shortcuts_help, vim.tbl_extend("force", opts, { desc = "Show review shortcuts" }))
 end
 
 map_list_buffer = function(buf)
@@ -1452,9 +2196,21 @@ map_list_buffer = function(buf)
       select_file(row - 1)
     end
   end, opts)
+  vim.keymap.set("n", "]f", function() select_file(state.file_index + 1) end, vim.tbl_extend("force", opts, { desc = "Next diff file" }))
+  vim.keymap.set("n", "[f", function() select_file(state.file_index - 1) end, vim.tbl_extend("force", opts, { desc = "Previous diff file" }))
+  vim.keymap.set("n", "]h", function() jump_hunk(1) end, vim.tbl_extend("force", opts, { desc = "Next diff hunk" }))
+  vim.keymap.set("n", "[h", function() jump_hunk(-1) end, vim.tbl_extend("force", opts, { desc = "Previous diff hunk" }))
+  vim.keymap.set("n", "J", function() jump_hunk(1) end, vim.tbl_extend("force", opts, { desc = "Next diff hunk" }))
+  vim.keymap.set("n", "K", function() jump_hunk(-1) end, vim.tbl_extend("force", opts, { desc = "Previous diff hunk" }))
+  vim.keymap.set("n", "]c", function() jump_annotation(1) end, vim.tbl_extend("force", opts, { desc = "Next review note" }))
+  vim.keymap.set("n", "[c", function() jump_annotation(-1) end, vim.tbl_extend("force", opts, { desc = "Previous review note" }))
+  vim.keymap.set("n", "C", function() jump_annotation(1) end, vim.tbl_extend("force", opts, { desc = "Next review note" }))
+  vim.keymap.set("n", "X", function() jump_annotation(-1) end, vim.tbl_extend("force", opts, { desc = "Previous review note" }))
   vim.keymap.set("n", "f", pick_file, vim.tbl_extend("force", opts, { desc = "Pick diff file" }))
+  vim.keymap.set("n", "c", open_notes_picker, vim.tbl_extend("force", opts, { desc = "Browse review comments" }))
   vim.keymap.set({ "n", "v" }, "b", toggle_file_list, vim.tbl_extend("force", opts, { desc = "Toggle file list" }))
   vim.keymap.set("n", "q", toggle_file_list, vim.tbl_extend("force", opts, { desc = "Hide file list" }))
+  vim.keymap.set("n", "?", show_shortcuts_help, vim.tbl_extend("force", opts, { desc = "Show review shortcuts" }))
 end
 
 create_scratch = function(name, filetype)
@@ -1514,6 +2270,7 @@ local function close_extra_empty_buffers()
 end
 
 local function reset_review_windows()
+  clear_pane_labels()
   clear_diff_windows()
   close_stale_review_windows()
   restore_previous_source()
@@ -1621,7 +2378,14 @@ local function source_signature(source, root)
   elseif source.kind == "commit" then
     return git_output({ "rev-parse", source.input }, root)
   elseif source.kind == "range" or source.kind == "branch" then
-    return git_output({ "rev-parse", source.old_source or "HEAD" }, root) .. ":" .. git_output({ "rev-parse", source.new_source or "HEAD" }, root)
+    local parts = {}
+    for _, ref in ipairs(source.watch_refs or { source.old_source or "HEAD", source.new_source or "HEAD" }) do
+      table.insert(parts, git_output({ "rev-parse", ref }, root))
+    end
+    if source.merge_base_refs then
+      table.insert(parts, git_merge_base(root, source.merge_base_refs[1], source.merge_base_refs[2]) or "")
+    end
+    return table.concat(parts, ":")
   end
   return source_diff(source, root)
 end
@@ -1665,13 +2429,13 @@ end
 function M.open_source(source)
   state.root = state.root or git_root()
   prune_old_state_files()
-  load_state(state.root)
   source = source or source_from("", state.root)
   local diff = source_diff(source, state.root)
 
   state.source = source
   state.comparison = source
   state.files = parse_diff(diff)
+  load_state(state.root, source)
   if state.file_index > #state.files then
     state.file_index = 1
   end
@@ -1699,9 +2463,22 @@ function M.open(input)
   end)
 end
 
+local function clear_active_review()
+  state.root = nil
+  state.comparison = nil
+  state.source = nil
+  state.files = {}
+  state.file_index = 1
+  state.annotations = {}
+  state.next_annotation_id = 1
+  state.interaction_active = false
+  state.pending_refresh = false
+end
+
 function M.close()
   stop_watch()
   reset_review_windows()
+  clear_active_review()
   if not source_win() then
     ensure_editor_space()
   end
@@ -1983,6 +2760,11 @@ function M.resolve_annotation(params)
 end
 
 function M.summary()
+  local context = M.get_context()
+  if not context.active then
+    return "There is no active Pi review diff. Open a review diff before applying review notes."
+  end
+
   local lines = {
     "Please apply the active Pi review diff notes.",
     "",
@@ -1995,12 +2777,26 @@ function M.summary()
     "- Refresh/check the diff when done and report any unresolved notes.",
     "",
     "Review context:",
-    vim.json.encode(M.get_context()),
+    vim.json.encode(context),
   }
   return table.concat(lines, "\n")
 end
 
 function M.get_context()
+  if not state.source or not state.comparison or not valid_win(state.new_win) then
+    return {
+      active = false,
+      root = nil,
+      comparison = nil,
+      source = nil,
+      files = {},
+      current_file = nil,
+      current_range = nil,
+      current_hunk = nil,
+      annotations = {},
+    }
+  end
+
   local file = current_file()
   local range = current_range()
   local annotations = {}
@@ -2022,6 +2818,7 @@ function M.get_context()
   end
 
   return {
+    active = true,
     root = state.root,
     comparison = state.comparison and state.comparison.label or nil,
     source = state.source and { kind = state.source.kind, label = state.source.label, input = state.source.input } or nil,
@@ -2124,6 +2921,8 @@ M._test = {
   patch_source = patch_source,
   pr_source = pr_source,
   split_args = split_args,
+  source_identity = source_identity,
+  state_path = state_path,
   apply_large_safeguard = apply_large_safeguard,
   large_line_threshold = large_line_threshold,
   omit_line_threshold = omit_line_threshold,
@@ -2196,7 +2995,7 @@ function M.setup_commands()
   vim.api.nvim_create_user_command("PiovimReviewRefresh", M.refresh, { desc = "Refresh Pi review diff", force = true })
   vim.api.nvim_create_user_command("PiovimReviewEditNote", edit_current_annotation, { desc = "Edit current Pi review note", force = true })
   vim.api.nvim_create_user_command("PiovimReviewDeleteNote", delete_current_annotation, { desc = "Delete current Pi review note", force = true })
-  vim.api.nvim_create_user_command("PiovimReviewNotes", set_quickfix, { desc = "Open Pi review notes quickfix", force = true })
+  vim.api.nvim_create_user_command("PiovimReviewNotes", open_notes_picker, { desc = "Browse Pi review notes", force = true })
 end
 
 return M

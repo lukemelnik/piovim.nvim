@@ -136,25 +136,33 @@ While a review is open, Piovim watches the active review source and refreshes wh
 
 Large files are guarded during rendering: files over 5,000 rendered lines are marked as large, and sides over 20,000 rendered lines are omitted with a placeholder instead of filling Neovim with huge buffers.
 
+The diff panes label their sources, such as `OLD · index` and `NEW · worktree`. Alignment filler is rendered blank, while real added blank lines show a faint `+` marker.
+
+Press `?` in a review diff window to show the shortcut list.
+
 Inside the diff view:
 
 | Key | Action |
 | --- | --- |
 | `]f` / `[f` | Next / previous file |
-| `f` | Pick file without focusing the file-list pane |
+| `f` | Pick file with preview |
 | `b` | Toggle the file-list pane |
 | `]h` / `[h` | Next / previous hunk |
-| `a` | Annotate current diff line |
-| visual `a` | Annotate selected diff lines |
-| `]c` / `[c` | Next / previous review note |
-| `e` | Edit the current/nearest review note |
-| `x` | Delete the current/nearest review note |
-| `z` | Toggle compact/expanded review notes |
-| `c` | Change comparison |
-| `Q` | Open review notes in quickfix |
+| `J` / `K` | Next / previous hunk fallback |
+| `a` | Comment on current diff line |
+| visual `a` | Comment on selected diff lines |
+| `]c` / `[c` | Next / previous review comment |
+| `C` / `X` | Next / previous review comment fallback |
+| `e` | Edit the current/nearest review comment |
+| `x` | Delete the current/nearest review comment |
+| `z` | Toggle compact/expanded review comments |
+| `c` | Browse review comments with context |
+| `s` | Change source/comparison |
+| `Q` | Open review comments in quickfix |
 | `r` | Refresh current comparison |
+| `?` | Show review diff shortcuts |
 
-`:PiovimReviewNotes` opens all current review annotations in the quickfix list.
+`:PiovimReviewNotes` opens a review-comment browser with context. `Q` still sends comments to the quickfix list.
 
 Custom diff args support simple shell-like quoting for paths with spaces, e.g. `/diff main...HEAD -- "docs/my file.md"`.
 
