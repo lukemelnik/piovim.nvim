@@ -1,22 +1,50 @@
-# piovim.nvim
+# piovim.nvim — Pi inside Neovim with live editor context
 
-Experimental Neovim frontend for [Pi](https://github.com/lukemelnik/pi-coding-agent) focused on live editor context.
+Piovim is an experimental Neovim frontend for [Pi](https://pi.dev) focused on collaborative editing, learning, and code review.
 
-Piovim runs Pi in RPC mode and opens a side-panel chat with a bottom prompt. It also loads a Pi extension that exposes explicit `nvim_*` tools for live Neovim buffers, diagnostics, highlights, previewed edits, saves, and safe buffer closing.
+Piovim runs Pi in RPC mode, opens a side-panel chat with a bottom prompt, and loads a bundled Pi extension that exposes explicit `nvim_*` tools for live Neovim buffers, diagnostics, highlights, previewed edits, saves, safe buffer closing, and review annotations.
+
+Pi's full terminal agent workflow is still the better fit for large autonomous edits and repo-wide implementation. Piovim is for moments where Neovim should be the shared workspace: explaining the code under your cursor, reading unsaved buffers, highlighting ranges, previewing small edits, and reviewing diffs with annotations.
+
+## What it does
+
+- **Live editor awareness** — Pi can inspect current/open Neovim buffers, including unsaved changes.
+- **Learning-oriented navigation** — Pi can open buffers, jump to lines, and highlight ranges while explaining code.
+- **Previewed buffer edits** — Pi can propose undoable in-place Neovim edits before anything is saved.
+- **Code review workflow** — Piovim provides a built-in diff viewer with notes, quickfix export, and Pi-visible annotations.
+- **Explicit tool boundary** — Pi uses `nvim_*` tools for live editor state and normal Pi tools for unopened files and disk state.
 
 ## Requirements
 
-- Neovim 0.10+
-- The `pi` CLI available on `$PATH`
-- Lazy.nvim or another Neovim plugin manager
+- Neovim 0.10+.
+- [Pi](https://pi.dev) installed, authenticated, and available as `pi` on Neovim's `$PATH`. Piovim relies on Pi RPC mode and TypeScript extension loading, so use a current Pi release.
+
+  ```sh
+  npm install -g @mariozechner/pi-coding-agent
+  pi
+  # Use /login, or configure an API-key provider, before using Piovim.
+  ```
+
+- `git` for review diffs and repository comparisons.
+- Lazy.nvim or another Neovim plugin manager that can install GitHub repos.
+
+Optional:
+
+- `gh` for GitHub PR review sources (`/diff pr`, `:PiovimReviewPR`).
+- [vim-tmux-navigator](https://github.com/christoomey/vim-tmux-navigator) for `<C-h/j/k/l>` navigation inside Piovim panels.
+
+There are no required Neovim plugin dependencies: no plenary.nvim, Telescope, nui.nvim, diffview.nvim, or Treesitter dependency.
 
 ## Installation
+
+Install directly from GitHub. Release tags are not required.
 
 With Lazy.nvim:
 
 ```lua
 {
   "lukemelnik/piovim.nvim",
+  version = false, -- track the GitHub branch instead of looking for release tags
   config = function()
     require("piovim").setup()
   end,
@@ -28,6 +56,7 @@ With custom options:
 ```lua
 {
   "lukemelnik/piovim.nvim",
+  version = false,
   config = function()
     require("piovim").setup({
       side_width = 80,
@@ -50,6 +79,8 @@ With custom options:
 }
 ```
 
+Run `:checkhealth piovim` after installing to verify Pi, git, the bundled extension, and optional integrations.
+
 ## Default keymaps
 
 Global keys:
@@ -68,6 +99,8 @@ Global keys:
 | `<leader>pT` | Cycle thinking level |
 | `<leader>pm` | Select model |
 | `<leader>pM` | Cycle model |
+
+If vim-tmux-navigator is installed, Piovim also maps `<C-h/j/k/l>` inside chat and prompt buffers to tmux-aware window navigation. Without it, those optional maps are not created.
 
 Prompt-buffer keys:
 
@@ -167,6 +200,10 @@ Inside the diff view:
 Custom diff args support simple shell-like quoting for paths with spaces, e.g. `/diff main...HEAD -- "docs/my file.md"`.
 
 Review annotations are persisted outside the repo at `stdpath("state")/piovim/reviews/` and old review state files are pruned after 30 days. Comments are anchored by file, line, selected text, and nearby context; refresh attempts to re-anchor notes when edits move code.
+
+## Inspiration
+
+Piovim's diff review flow is inspired by [diffview.nvim](https://github.com/sindrets/diffview.nvim): side-by-side review, file navigation, hunk movement, and a review-focused workspace. Piovim does not depend on diffview.nvim; it keeps the diff state inside Piovim so Pi can inspect the active comparison and add or resolve annotations through `nvim_*` tools.
 
 ## Neovim tools
 
@@ -290,24 +327,23 @@ nvim --headless -u NONE --cmd 'set rtp^=/path/to/piovim.nvim' -S scripts/smoke.l
 nvim --headless -u NONE --cmd 'set rtp^=/path/to/piovim.nvim' -S scripts/review_diff_tests.lua -c 'qa'
 ```
 
-## Release flow
+## Release tags
 
-Piovim uses simple git tags for releases.
+Release tags are not required for GitHub installation. Until the plugin stabilizes, installing from `main` is expected; Lazy.nvim's lockfile records the exact commit for reproducible installs.
 
-1. Make changes and run checks.
-2. Commit with a conventional commit message.
-3. Choose a semver tag:
-   - `v0.0.x` for fixes/internal polish while experimental
-   - `v0.x.0` for user-facing features
-   - `v1.0.0` only once the API/UX is stable
-4. Create and push the tag:
+For maximum stability before tags exist, pin a commit:
 
-```sh
-git tag v0.1.0
-git push origin main --tags
+```lua
+{
+  "lukemelnik/piovim.nvim",
+  commit = "<commit-sha>",
+  config = function()
+    require("piovim").setup()
+  end,
+}
 ```
 
-Lazy.nvim users can pin a release:
+Once release tags exist, users can pin a semver tag instead:
 
 ```lua
 {
@@ -318,8 +354,6 @@ Lazy.nvim users can pin a release:
   end,
 }
 ```
-
-Until the plugin stabilizes, installing from `main` is expected.
 
 ## Status
 

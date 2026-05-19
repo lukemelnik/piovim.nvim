@@ -2616,11 +2616,7 @@ end
 
 local function pick_pr()
   if vim.fn.executable("gh") ~= 1 then
-    tracked_input({ prompt = "PR number: " }, function(input)
-      if input then
-        M.open_pr(input)
-      end
-    end)
+    vim.notify("GitHub PR review requires the gh CLI", vim.log.levels.WARN)
     return
   end
 

@@ -205,7 +205,7 @@ local function register_slash_commands()
   Panel.set_slash_commands(slash_commands)
 end
 
-local function set_panel_keymaps(buf)
+local function set_tmux_navigation_keymaps(buf)
   local maps = {
     h = "Left",
     j = "Down",
@@ -213,9 +213,16 @@ local function set_panel_keymaps(buf)
     l = "Right",
   }
   for key, direction in pairs(maps) do
-    vim.keymap.set("n", "<C-" .. key .. ">", "<Cmd>TmuxNavigate" .. direction .. "<CR>", { buffer = buf })
-    vim.keymap.set("i", "<C-" .. key .. ">", "<Esc><Cmd>TmuxNavigate" .. direction .. "<CR>", { buffer = buf })
+    local command = "TmuxNavigate" .. direction
+    if vim.fn.exists(":" .. command) == 2 then
+      vim.keymap.set("n", "<C-" .. key .. ">", "<Cmd>" .. command .. "<CR>", { buffer = buf, desc = "Tmux navigate " .. direction })
+      vim.keymap.set("i", "<C-" .. key .. ">", "<Esc><Cmd>" .. command .. "<CR>", { buffer = buf, desc = "Tmux navigate " .. direction })
+    end
   end
+end
+
+local function set_panel_keymaps(buf)
+  set_tmux_navigation_keymaps(buf)
 
   local ft = vim.bo[buf].filetype
   if ft == "piovim-chat" then
