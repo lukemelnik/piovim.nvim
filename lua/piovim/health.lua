@@ -61,7 +61,14 @@ function M.check()
   if vim.fn.executable("gh") == 1 then
     ok("gh found on PATH for PR review sources")
   else
-    warn("gh not found; PR review picker will only support manual PR number entry", { "Install GitHub CLI for PR lists and current-branch PR diffs." })
+    warn("gh not found; GitHub PR review sources are unavailable", { "Install GitHub CLI to review GitHub PR diffs from Piovim." })
+  end
+
+  ok("No required Neovim plugin dependencies")
+  if vim.fn.exists(":TmuxNavigateLeft") == 2 then
+    ok("Optional vim-tmux-navigator commands found for panel navigation")
+  else
+    ok("Optional vim-tmux-navigator commands not found; Ctrl-h/j/k/l panel navigation is disabled")
   end
 
   local extension = plugin_root() .. "/pi-extension/nvim-tools.ts"
