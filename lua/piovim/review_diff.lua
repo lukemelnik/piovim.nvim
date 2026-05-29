@@ -416,6 +416,84 @@ local function parse_hunk_header(line)
   }
 end
 
+local binary_extensions = {
+  avif = true,
+  bmp = true,
+  db = true,
+  dmg = true,
+  eot = true,
+  exe = true,
+  flac = true,
+  gif = true,
+  gz = true,
+  heic = true,
+  ico = true,
+  icns = true,
+  jar = true,
+  jpeg = true,
+  jpg = true,
+  mov = true,
+  mp3 = true,
+  mp4 = true,
+  otf = true,
+  pdf = true,
+  png = true,
+  sqlite = true,
+  tar = true,
+  ttf = true,
+  wasm = true,
+  wav = true,
+  webp = true,
+  woff = true,
+  woff2 = true,
+  zip = true,
+}
+
+local function binary_extension(path)
+  local ext = vim.fn.fnamemodify(path or "", ":e"):lower()
+  return binary_extensions[ext] == true
+end
+
+local function binary_data(data)
+  if not data or data == "" then
+    return false
+  end
+  if data:find("\0", 1, true) then
+    return true
+  end
+
+  local control = 0
+  for index = 1, #data do
+    local byte = data:byte(index)
+    if byte < 32 and byte ~= 9 and byte ~= 10 and byte ~= 12 and byte ~= 13 then
+      control = control + 1
+    end
+  end
+  return control > 0 and (control / #data) > 0.01
+end
+
+local function binary_file(path)
+  if binary_extension(path) then
+    return true
+  end
+  local fd = vim.uv.fs_open(path, "r", 438)
+  if not fd then
+    return false
+  end
+  local data = vim.uv.fs_read(fd, 8192, 0)
+  vim.uv.fs_close(fd)
+  return binary_data(data)
+end
+
+local function append_untracked_binary_diff(chunks, path)
+  table.insert(chunks, "diff --git a/" .. path .. " b/" .. path)
+  table.insert(chunks, "new file mode 100644")
+  table.insert(chunks, "index 0000000..0000000")
+  table.insert(chunks, "--- /dev/null")
+  table.insert(chunks, "+++ b/" .. path)
+  table.insert(chunks, "Binary files /dev/null and b/" .. path .. " differ")
+end
+
 local function untracked_diff(root)
   local output = git_output({ "ls-files", "--others", "--exclude-standard" }, root)
   local chunks = {}
@@ -423,28 +501,32 @@ local function untracked_diff(root)
   for _, path in ipairs(vim.split(output, "\n", { plain = true, trimempty = true })) do
     local full_path = root .. "/" .. path
     local stat = vim.uv.fs_stat(full_path)
-    if vim.fn.filereadable(full_path) == 1 and stat and stat.size <= max_untracked_file_bytes then
-      local lines = vim.fn.readfile(full_path)
-      table.insert(chunks, "diff --git a/" .. path .. " b/" .. path)
-      table.insert(chunks, "new file mode 100644")
-      table.insert(chunks, "index 0000000..0000000")
-      table.insert(chunks, "--- /dev/null")
-      table.insert(chunks, "+++ b/" .. path)
-      table.insert(chunks, "@@ -0,0 +1," .. tostring(#lines) .. " @@")
-      for _, line in ipairs(lines) do
-        table.insert(chunks, "+" .. line)
+    if vim.fn.filereadable(full_path) == 1 and stat then
+      if binary_file(full_path) then
+        append_untracked_binary_diff(chunks, path)
+      elseif stat.size <= max_untracked_file_bytes then
+        local lines = vim.fn.readfile(full_path)
+        table.insert(chunks, "diff --git a/" .. path .. " b/" .. path)
+        table.insert(chunks, "new file mode 100644")
+        table.insert(chunks, "index 0000000..0000000")
+        table.insert(chunks, "--- /dev/null")
+        table.insert(chunks, "+++ b/" .. path)
+        table.insert(chunks, "@@ -0,0 +1," .. tostring(#lines) .. " @@")
+        for _, line in ipairs(lines) do
+          table.insert(chunks, "+" .. line)
+        end
+      else
+        table.insert(chunks, "diff --git a/" .. path .. " b/" .. path)
+        table.insert(chunks, "new file mode 100644")
+        table.insert(chunks, "--- /dev/null")
+        table.insert(chunks, "+++ b/" .. path)
+        table.insert(chunks, "@@ -0,0 +1,5 @@")
+        table.insert(chunks, "+Large untracked file omitted from Pi review rendering")
+        table.insert(chunks, "+file: " .. path)
+        table.insert(chunks, "+bytes: " .. tostring(stat.size))
+        table.insert(chunks, "+threshold: " .. tostring(max_untracked_file_bytes))
+        table.insert(chunks, "+Open the source file directly or narrow the review source to inspect this file.")
       end
-    elseif stat and stat.size > max_untracked_file_bytes then
-      table.insert(chunks, "diff --git a/" .. path .. " b/" .. path)
-      table.insert(chunks, "new file mode 100644")
-      table.insert(chunks, "--- /dev/null")
-      table.insert(chunks, "+++ b/" .. path)
-      table.insert(chunks, "@@ -0,0 +1,5 @@")
-      table.insert(chunks, "+Large untracked file omitted from Pi review rendering")
-      table.insert(chunks, "+file: " .. path)
-      table.insert(chunks, "+bytes: " .. tostring(stat.size))
-      table.insert(chunks, "+threshold: " .. tostring(max_untracked_file_bytes))
-      table.insert(chunks, "+Open the source file directly or narrow the review source to inspect this file.")
     end
   end
 
@@ -781,10 +863,25 @@ local function lock_review_buf(buf)
   end
 end
 
+local function normalize_buffer_lines(lines)
+  local normalized = {}
+  for _, line in ipairs(lines or {}) do
+    line = tostring(line)
+    if line:find("\n", 1, true) then
+      for _, part in ipairs(vim.split(line, "\n", { plain = true })) do
+        table.insert(normalized, part)
+      end
+    else
+      table.insert(normalized, line)
+    end
+  end
+  return normalized
+end
+
 local function set_buf_lines(buf, lines)
   vim.bo[buf].readonly = false
   vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, normalize_buffer_lines(lines))
   lock_review_buf(buf)
 end
 
@@ -1648,9 +1745,11 @@ local function open_notes_picker()
   end
 
   local function set_lines(buf, lines)
+    local normalized = normalize_buffer_lines(lines)
     vim.bo[buf].modifiable = true
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, normalized)
     vim.bo[buf].modifiable = false
+    return normalized
   end
 
   local function add_inline_prefix(buf, row, text, hl_group)
@@ -1681,7 +1780,7 @@ local function open_notes_picker()
     vim.bo[preview_buf].filetype = context.filetype ~= "" and context.filetype or "text"
     vim.bo[preview_buf].syntax = vim.bo[preview_buf].filetype
     pcall(vim.treesitter.start, preview_buf, vim.bo[preview_buf].filetype)
-    set_lines(preview_buf, context.lines)
+    local rendered_lines = set_lines(preview_buf, context.lines)
 
     local header_lines = {
       { { context.header, "PiovimReviewNoteHeader" } },
@@ -1696,12 +1795,12 @@ local function open_notes_picker()
       priority = 150,
     })
 
-    for index = 1, #context.lines do
+    for index = 1, #rendered_lines do
       local source_line = context.start_line + index - 1
       local marker = index == context.target_row and "▸" or " "
       add_inline_prefix(preview_buf, index - 1, string.format("%s %4d  ", marker, source_line), "LineNr")
     end
-    if context.target_row >= 1 and context.target_row <= #context.lines then
+    if context.target_row >= 1 and context.target_row <= #rendered_lines then
       vim.api.nvim_buf_set_extmark(preview_buf, ns, context.target_row - 1, 0, {
         line_hl_group = "PiovimReviewNoteTarget",
         priority = 120,
@@ -1984,9 +2083,11 @@ local function pick_file()
   end
 
   local function set_lines(buf, lines)
+    local normalized = normalize_buffer_lines(lines)
     vim.bo[buf].modifiable = true
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, normalized)
     vim.bo[buf].modifiable = false
+    return normalized
   end
 
   local function add_inline_prefix(buf, line, text, hl_group)
@@ -2029,7 +2130,7 @@ local function pick_file()
     if #lines == 0 then
       lines = { "No new-side content for this file." }
     end
-    set_lines(preview_buf, lines)
+    lines = set_lines(preview_buf, lines)
     if valid_win(preview_win) then
       vim.api.nvim_win_set_config(preview_win, { title = " " .. file.path .. " " })
       pcall(vim.api.nvim_win_set_cursor, preview_win, { 1, 0 })
@@ -2917,9 +3018,11 @@ M._test = {
   patch_source = patch_source,
   pr_source = pr_source,
   split_args = split_args,
+  untracked_diff = untracked_diff,
   source_identity = source_identity,
   state_path = state_path,
   apply_large_safeguard = apply_large_safeguard,
+  normalize_buffer_lines = normalize_buffer_lines,
   large_line_threshold = large_line_threshold,
   omit_line_threshold = omit_line_threshold,
 }

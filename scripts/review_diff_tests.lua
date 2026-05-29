@@ -91,6 +91,27 @@ local function test_binary_file()
   assert_eq(files[1].metadata[1], "Binary files a/image.png and b/image.png differ", "binary metadata")
 end
 
+local function test_untracked_binary_file_is_metadata_only()
+  local root = vim.fn.tempname()
+  vim.fn.mkdir(root, "p")
+  local init = vim.system({ "git", "init", "-q" }, { cwd = root }):wait()
+  assert_eq(init.code, 0, "temp repo init")
+
+  local fd = assert(vim.uv.fs_open(root .. "/image.png", "w", 420))
+  assert(vim.uv.fs_write(fd, string.char(0x89) .. "PNG\r\n\26\n" .. string.char(0, 0, 0, 13), 0))
+  vim.uv.fs_close(fd)
+
+  local diff = T.untracked_diff(root)
+  assert_true(diff:find("Binary files /dev/null and b/image.png differ", 1, true), "untracked image should render as binary metadata")
+  assert_true(not diff:find("@@", 1, true), "untracked image should not create text hunks")
+
+  local files = T.parse_diff(diff)
+  assert_eq(#files, 1, "untracked binary file count")
+  assert_true(files[1].binary, "untracked binary marker")
+  assert_eq(#files[1].hunks, 0, "untracked binary hunk count")
+  pcall(vim.fn.delete, root, "rf")
+end
+
 local function test_rename_only_file()
   local files = T.parse_diff(table.concat({
     "diff --git a/old.txt b/new.txt",
@@ -134,6 +155,14 @@ local function test_large_file_safeguard()
   assert_true(file.omitted, "large file omitted")
   assert_true(file.large, "large file marked large")
   assert_eq(rendered[1], "Large file omitted from Pi review rendering", "large placeholder")
+end
+
+local function test_normalize_buffer_lines_splits_embedded_newlines()
+  local lines = T.normalize_buffer_lines({ "one\ntwo", "three", "four\n" })
+  assert_eq(#lines, 5, "embedded newline split count")
+  assert_eq(lines[1], "one", "embedded newline first part")
+  assert_eq(lines[2], "two", "embedded newline second part")
+  assert_eq(lines[5], "", "trailing newline preserves blank line")
 end
 
 local function test_split_args_with_quotes()
@@ -190,9 +219,11 @@ test_plain_unified_patch()
 test_added_blank_line_tracking()
 test_deleted_file()
 test_binary_file()
+test_untracked_binary_file_is_metadata_only()
 test_rename_only_file()
 test_mode_only_file()
 test_large_file_safeguard()
+test_normalize_buffer_lines_splits_embedded_newlines()
 test_split_args_with_quotes()
 test_pr_source()
 test_source_materialization()
