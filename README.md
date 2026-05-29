@@ -24,15 +24,6 @@ pi
 # Then quit Pi and return to Neovim.
 ```
 
-Migrating from the old npm scope? Uninstall only the old global package first if npm reports a `pi` binary conflict:
-
-```sh
-npm uninstall -g @mariozechner/pi-coding-agent
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
-```
-
-Do not delete `~/.pi/agent`; that is where Pi keeps settings, sessions, extensions, skills, prompts, themes, and package config.
-
 ### 2. Install piovim.nvim
 
 With Lazy.nvim:
