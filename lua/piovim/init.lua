@@ -4,8 +4,11 @@ local Panel = require("piovim.panel")
 local Rpc = require("piovim.rpc")
 local ReviewDiff = require("piovim.review_diff")
 local SelfFix = require("piovim.self_fix")
+local version = require("piovim.version")
 
-local M = {}
+local M = {
+  version = version,
+}
 
 local config = {
   bin = "pi",
@@ -271,6 +274,9 @@ local function setup_commands()
   command("PiovimAsk", M.prompt_input, { desc = "Ask Pi about current selection or buffer", range = true })
   command("PiovimStop", M.stop, { desc = "Stop Piovim process" })
   command("PiovimClear", M.clear, { desc = "Clear Piovim session" })
+  command("PiovimVersion", function()
+    print("piovim.nvim " .. M.version)
+  end, { desc = "Print Piovim version" })
   command("PiovimClearHighlights", M.clear_highlights, { desc = "Clear Pi code highlights" })
   command("PiovimAppendContext", M.append_context, { desc = "Append current Pi context mention" })
   command("PiovimSelfFix", M.append_self_fix_context, { desc = "Append Piovim self-fix context" })

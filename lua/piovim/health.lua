@@ -1,3 +1,5 @@
+local version = require("piovim.version")
+
 local M = {}
 
 local function start(name)
@@ -39,6 +41,7 @@ end
 
 function M.check()
   start("piovim.nvim")
+  ok("Version " .. version)
 
   if vim.fn.has("nvim-0.10") == 1 then
     ok("Neovim 0.10+ detected")
