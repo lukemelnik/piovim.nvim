@@ -166,6 +166,22 @@ local function handle_extension_ui_request(msg)
     return
   end
 
+  if msg.method == "set_editor_text" then
+    Panel.set_prompt_text(msg.text or "")
+    return
+  end
+
+  if msg.method == "setStatus" then
+    if msg.statusKey == "piovim:refresh_messages" then
+      M.refresh_messages()
+    end
+    return
+  end
+
+  if msg.method == "setWidget" or msg.method == "setTitle" then
+    return
+  end
+
   if msg.method == "select" then
     vim.ui.select(msg.options or {}, { prompt = msg.title or "Pi" }, function(choice)
       if choice == nil then
@@ -218,6 +234,11 @@ local function handle_event(msg)
     state.abort_sent = false
     set_status_mode("idle")
     Panel.assistant_end()
+    return
+  end
+
+  if msg.type == "session_tree" then
+    M.refresh_messages()
     return
   end
 
@@ -319,7 +340,6 @@ function M.start(opts)
     opts.bin or "pi",
     "--mode",
     "rpc",
-    "--no-session",
     "--extension",
     extension_path,
     "--append-system-prompt",
@@ -442,6 +462,53 @@ function M.refresh_state()
   end
 end
 
+function M.refresh_messages()
+  if not state.job then
+    return false
+  end
+
+  return M.send({ type = "get_messages" }, function(msg)
+    if not msg.success then
+      append_error(msg.error or "Failed to refresh Pi messages")
+      return
+    end
+    local messages = (msg.data or {}).messages or {}
+    Panel.replace_messages(messages)
+  end)
+end
+
+function M.new_session(callback)
+  if not state.job then
+    if callback then
+      callback(true)
+    end
+    return true
+  end
+
+  return M.send({ type = "new_session" }, function(msg)
+    if not msg.success then
+      append_error(msg.error or "Failed to start new Pi session")
+      if callback then
+        callback(false)
+      end
+      return
+    end
+
+    if (msg.data or {}).cancelled then
+      Panel.system("Pi session clear cancelled")
+      if callback then
+        callback(false)
+      end
+      return
+    end
+
+    M.refresh_state()
+    if callback then
+      callback(true)
+    end
+  end)
+end
+
 function M.cycle_thinking_level()
   if state.job then
     M.send({ type = "cycle_thinking_level" })
@@ -458,6 +525,17 @@ function M.cycle_model()
   if state.job then
     M.send({ type = "cycle_model" })
   end
+end
+
+function M.tree()
+  if not state.job then
+    return false
+  end
+  if state.streaming then
+    append_error("Cannot open Pi session tree while Pi is running")
+    return false
+  end
+  return M.send({ type = "prompt", message = "/piovim-tree" })
 end
 
 function M.select_model()

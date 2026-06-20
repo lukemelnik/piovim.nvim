@@ -139,12 +139,25 @@ function M.stop()
   Panel.close()
 end
 
-function M.clear()
-  Rpc.stop()
+local function reset_panel()
   Bridge.clear_highlights()
   Panel.clear()
   Panel.open({ width = config.side_width, focus_prompt = true })
   Panel.focus_prompt()
+end
+
+function M.clear()
+  if Rpc.is_running() and not Rpc.is_streaming() then
+    Rpc.new_session(function(cleared)
+      if cleared then
+        reset_panel()
+      end
+    end)
+    return
+  end
+
+  Rpc.stop()
+  reset_panel()
 end
 
 function M.clear_highlights()
@@ -184,6 +197,12 @@ function M.cycle_model()
   end
 end
 
+function M.tree()
+  if ensure_started() then
+    Rpc.tree()
+  end
+end
+
 function M.apply_review_fixes()
   if not ensure_started() then
     return
@@ -201,6 +220,7 @@ local function register_slash_commands()
     { name = "/clear", description = "Clear Pi session", handler = M.clear },
     { name = "/model", description = "Select model", handler = M.select_model },
     { name = "/thinking", description = "Select thinking level", handler = M.select_thinking_level },
+    { name = "/tree", description = "Navigate Pi session tree", handler = M.tree },
     { name = "/pi-fix", description = "Append Piovim self-fix context", handler = M.append_self_fix_context },
     { name = "/diff", description = "Open review diff picker", handler = ReviewDiff.pick, accepts_args = true },
     { name = "/apply", description = "Ask Pi to apply active review notes", handler = M.apply_review_fixes },
@@ -285,6 +305,7 @@ local function setup_commands()
   command("PiovimThinkingSelect", M.select_thinking_level, { desc = "Select Pi thinking level" })
   command("PiovimModelSelect", M.select_model, { desc = "Select Pi model" })
   command("PiovimModelCycle", M.cycle_model, { desc = "Cycle Pi model" })
+  command("PiovimTree", M.tree, { desc = "Navigate Pi session tree" })
   ReviewDiff.setup_commands()
 end
 

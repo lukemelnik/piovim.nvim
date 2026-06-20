@@ -101,7 +101,165 @@ const bufferTargetSchema = {
   bufnr: Type.Optional(Type.Number({ description: "Neovim buffer number. Prefer path unless the tool returned a bufnr." })),
 };
 
+type SessionEntryLike = {
+  id: string;
+  parentId: string | null;
+  type: string;
+  timestamp?: string;
+  message?: { role?: string; content?: unknown; toolName?: string };
+  content?: unknown;
+  provider?: string;
+  modelId?: string;
+  thinkingLevel?: string;
+  summary?: string;
+  customType?: string;
+};
+
+type SessionTreeNodeLike = {
+  entry: SessionEntryLike;
+  children: SessionTreeNodeLike[];
+  label?: string;
+};
+
+function textFromContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((item): item is { type?: string; text?: string } => typeof item === "object" && item !== null)
+    .filter((item) => item.type === "text" && typeof item.text === "string")
+    .map((item) => item.text)
+    .join("");
+}
+
+function compactWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function truncateLabel(text: string, maxLength = 96): string {
+  const compact = compactWhitespace(text);
+  if (compact.length <= maxLength) return compact;
+  return compact.slice(0, maxLength - 1) + "…";
+}
+
+function stripPiovimContext(text: string): string {
+  const markers = [
+    "\n\nLive Neovim selection from ",
+    "\n\nCurrent Neovim buffer metadata:",
+    "\n\nThe current Neovim buffer is not a file-backed code buffer.",
+  ];
+  for (const marker of markers) {
+    const index = text.indexOf(marker);
+    if (index !== -1) return text.slice(0, index).trim();
+  }
+  return text.trim();
+}
+
+function entrySummary(entry: SessionEntryLike): { kind: string; text: string; editorText?: string; hidden?: boolean } {
+  if (entry.type === "message") {
+    const role = entry.message?.role ?? "message";
+    if (role === "toolResult") {
+      return { kind: "tool", text: String(entry.message?.toolName ?? "tool result"), hidden: true };
+    }
+    const text = textFromContent(entry.message?.content);
+    const displayText = role === "user" ? stripPiovimContext(text) : text;
+    return {
+      kind: role,
+      text: truncateLabel(displayText || role),
+      editorText: role === "user" ? displayText : undefined,
+    };
+  }
+
+  if (entry.type === "custom_message") {
+    const text = textFromContent(entry.content);
+    return {
+      kind: entry.customType ? `custom:${entry.customType}` : "custom",
+      text: truncateLabel(text || "custom message"),
+      editorText: text,
+    };
+  }
+
+  if (entry.type === "branch_summary") {
+    return { kind: "branch", text: truncateLabel(entry.summary ?? "branch summary") };
+  }
+
+  if (entry.type === "compaction") {
+    return { kind: "compact", text: truncateLabel(entry.summary ?? "compaction summary") };
+  }
+
+  if (entry.type === "model_change" || entry.type === "thinking_level_change") {
+    return { kind: entry.type, text: entry.type, hidden: true };
+  }
+
+  if (entry.type === "label" || entry.type === "session_info" || entry.type === "custom") {
+    return { kind: entry.type, text: entry.type, hidden: true };
+  }
+
+  return { kind: entry.type, text: entry.type };
+}
+
+function flattenTree(nodes: SessionTreeNodeLike[], opts: {
+  branchIds: Set<string>;
+  leafId: string | null;
+  byChoice: Map<string, { entry: SessionEntryLike; editorText?: string }>;
+  lines: string[];
+  depth?: number;
+}) {
+  const depth = opts.depth ?? 0;
+  for (const node of nodes) {
+    const summary = entrySummary(node.entry);
+    const childDepth = summary.hidden ? depth : depth + 1;
+
+    if (!summary.hidden) {
+      const marker = node.entry.id === opts.leafId ? "●" : opts.branchIds.has(node.entry.id) ? "•" : " ";
+      const label = node.label ? ` [${node.label}]` : "";
+      const indent = "  ".repeat(depth);
+      const line = `${marker} ${indent}${summary.kind}: ${summary.text}${label}  #${node.entry.id}`;
+      opts.lines.push(line);
+      opts.byChoice.set(line, { entry: node.entry, editorText: summary.editorText });
+    }
+
+    flattenTree(node.children ?? [], { ...opts, depth: childDepth });
+  }
+}
+
 export default function (pi: ExtensionAPI) {
+  pi.registerCommand("piovim-tree", {
+    description: "Navigate the current Pi session tree from Piovim",
+    handler: async (_args, ctx) => {
+      await ctx.waitForIdle();
+
+      const roots = ctx.sessionManager.getTree() as SessionTreeNodeLike[];
+      if (roots.length === 0) {
+        ctx.ui.notify("No Pi session entries yet.", "info");
+        return;
+      }
+
+      const branchIds = new Set(ctx.sessionManager.getBranch().map((entry) => entry.id));
+      const leafId = ctx.sessionManager.getLeafId();
+      const byChoice = new Map<string, { entry: SessionEntryLike; editorText?: string }>();
+      const lines: string[] = [];
+      flattenTree(roots, { branchIds, leafId, byChoice, lines });
+
+      if (lines.length === 0) {
+        ctx.ui.notify("No visible Pi session entries yet.", "info");
+        return;
+      }
+
+      const choice = await ctx.ui.select("Pi session tree", lines);
+      if (!choice) return;
+
+      const selected = byChoice.get(choice);
+      if (!selected) return;
+
+      const result = await ctx.navigateTree(selected.entry.id, { summarize: false });
+      if (result.cancelled) return;
+
+      ctx.ui.setStatus("piovim:refresh_messages", String(Date.now()));
+      ctx.ui.setEditorText(selected.editorText ?? "");
+      ctx.ui.notify("Moved Pi session to selected tree point.", "info");
+    },
+  });
+
   pi.registerTool({
     name: "nvim_get_context",
     label: "Neovim Context",
