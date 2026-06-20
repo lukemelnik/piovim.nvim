@@ -31,7 +31,7 @@ With Lazy.nvim:
 ```lua
 {
   "lukemelnik/piovim.nvim",
-  version = "v0.1.0",
+  version = "v0.2.0",
   config = function()
     require("piovim").setup()
   end,
@@ -396,7 +396,7 @@ Users can pin a semver tag with Lazy.nvim:
 ```lua
 {
   "lukemelnik/piovim.nvim",
-  version = "v0.1.0",
+  version = "v0.2.0",
   config = function()
     require("piovim").setup()
   end,
