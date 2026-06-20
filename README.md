@@ -31,7 +31,7 @@ With Lazy.nvim:
 ```lua
 {
   "lukemelnik/piovim.nvim",
-  version = "v0.1.0",
+  version = "v0.2.0",
   config = function()
     require("piovim").setup()
   end,
@@ -55,6 +55,7 @@ If `:checkhealth piovim` cannot find `pi`, launch Neovim from the same shell whe
 - **Learning-oriented navigation** — Pi can open files, jump to lines, and highlight ranges while explaining code.
 - **Previewed buffer edits** — Pi can propose undoable in-place Neovim edits before anything is saved.
 - **Code review workflow** — Piovim includes a diff viewer with notes, quickfix export, and Pi-visible annotations.
+- **Session tree rewind** — `:PiovimTree` opens the current Pi session tree so tangents can be discarded from context.
 - **Explicit tool boundary** — Pi uses `nvim_*` tools for live editor state and normal Pi tools for unopened files and disk state.
 
 Pi's full terminal agent workflow is still the better fit for large autonomous edits and repo-wide implementation. Piovim is for moments where Neovim should be the shared workspace: explaining the code under the cursor, reading unsaved buffers, highlighting ranges, previewing small edits, and reviewing diffs with annotations.
@@ -188,6 +189,7 @@ Typed in the Piovim prompt:
 - `/clear` clears the current Pi session, visible chat, prompt, and highlights.
 - `/model` opens model selection.
 - `/thinking` opens thinking-level selection.
+- `/tree` opens the Pi session tree picker.
 - `/diff` opens the Pi review-source picker.
 - `/diff <args>` opens a Pi review diff with custom `git diff` args, e.g. `/diff main...HEAD`.
 - `/diff pr` or `/diff pr 123` opens the current branch PR or a numbered GitHub PR via `gh`.
@@ -303,6 +305,7 @@ Piovim exposes explicit Pi tools for live editor state:
 - `:PiovimThinkingCycle`
 - `:PiovimModelSelect`
 - `:PiovimModelCycle`
+- `:PiovimTree`
 - `:PiovimReviewDiff [working-tree|staged|main|origin/main|<git diff args>]`
 - `:PiovimReviewCommit [rev]`
 - `:PiovimReviewRange [range]`
@@ -393,7 +396,7 @@ Users can pin a semver tag with Lazy.nvim:
 ```lua
 {
   "lukemelnik/piovim.nvim",
-  version = "v0.1.0",
+  version = "v0.2.0",
   config = function()
     require("piovim").setup()
   end,

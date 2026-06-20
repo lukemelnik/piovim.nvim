@@ -598,6 +598,100 @@ function M.complete_slash_command()
   return true
 end
 
+local function message_content_text(content)
+  if type(content) == "string" then
+    return content
+  end
+  if type(content) ~= "table" then
+    return ""
+  end
+
+  local parts = {}
+  for _, item in ipairs(content) do
+    if type(item) == "table" then
+      if item.type == "text" and type(item.text) == "string" then
+        parts[#parts + 1] = item.text
+      elseif item.type == "image" then
+        parts[#parts + 1] = "[image]"
+      end
+    end
+  end
+  return table.concat(parts, "")
+end
+
+local function assistant_content_text(content)
+  if type(content) ~= "table" then
+    return ""
+  end
+
+  local parts = {}
+  for _, item in ipairs(content) do
+    if type(item) == "table" and item.type == "text" and type(item.text) == "string" then
+      parts[#parts + 1] = item.text
+    end
+  end
+  return table.concat(parts, "")
+end
+
+local function strip_piovim_context(text)
+  local markers = {
+    "\n\nLive Neovim selection from ",
+    "\n\nCurrent Neovim buffer metadata:",
+    "\n\nThe current Neovim buffer is not a file-backed code buffer.",
+  }
+  for _, marker in ipairs(markers) do
+    local start = text:find(marker, 1, true)
+    if start then
+      return vim.trim(text:sub(1, start - 1))
+    end
+  end
+  return vim.trim(text)
+end
+
+local function truncated(text, max_length)
+  max_length = max_length or 160
+  text = vim.trim((text or ""):gsub("%s+", " "))
+  if #text <= max_length then
+    return text
+  end
+  return text:sub(1, max_length - 1) .. "…"
+end
+
+function M.replace_messages(messages)
+  M.clear()
+  state.active_assistant = false
+
+  for _, message in ipairs(messages or {}) do
+    if type(message) == "table" and message.role == "user" then
+      local text = strip_piovim_context(message_content_text(message.content))
+      if text ~= "" then
+        M.user_message(text)
+      end
+    elseif type(message) == "table" and message.role == "assistant" then
+      local text = assistant_content_text(message.content)
+      if vim.trim(text) ~= "" then
+        M.assistant_start()
+        M.append_text(text)
+        M.assistant_end()
+      end
+    elseif type(message) == "table" and message.role == "custom" and message.display ~= false then
+      local text = message_content_text(message.content)
+      if text ~= "" then
+        M.system((message.customType or "custom") .. ": " .. truncated(text))
+      end
+    elseif type(message) == "table" and message.role == "bashExecution" and message.excludeFromContext ~= true then
+      M.system("ran `" .. truncated(message.command or "bash", 120) .. "`")
+    elseif type(message) == "table" and message.role == "branchSummary" then
+      M.system("branch summary: " .. truncated(message.summary))
+    elseif type(message) == "table" and message.role == "compactionSummary" then
+      M.system("compaction summary: " .. truncated(message.summary))
+    end
+  end
+
+  state.active_assistant = false
+  scroll_to_bottom()
+end
+
 function M.submit_prompt()
   local text = M.prompt_text()
   if text == "" then
