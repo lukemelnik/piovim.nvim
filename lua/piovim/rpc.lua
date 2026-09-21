@@ -15,9 +15,13 @@ local state = {
   tool_name = nil,
   model_name = nil,
   thinking_level = nil,
+  context_usage = nil,
+  auto_compaction_enabled = nil,
   callbacks = {},
   spinner_timer = nil,
   spinner_index = 1,
+  assistant_text_seen = false,
+  on_lifecycle = nil,
 }
 
 local function plugin_root()
@@ -29,7 +33,66 @@ local function append_error(message)
   Panel.system("error: " .. message)
 end
 
+local function message_content_text(content)
+  if type(content) == "string" then
+    return content
+  end
+  if type(content) ~= "table" then
+    return ""
+  end
+
+  local parts = {}
+  for _, item in ipairs(content) do
+    if type(item) == "table" and item.type == "text" and type(item.text) == "string" then
+      parts[#parts + 1] = item.text
+    end
+  end
+  return table.concat(parts, "")
+end
+
 local spinner_frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+
+local function format_tokens(count)
+  count = tonumber(count)
+  if not count then
+    return "?"
+  end
+  if count < 1000 then
+    return tostring(math.floor(count + 0.5))
+  end
+  if count < 10000 then
+    return string.format("%.1fk", count / 1000)
+  end
+  if count < 1000000 then
+    return tostring(math.floor((count / 1000) + 0.5)) .. "k"
+  end
+  if count < 10000000 then
+    return string.format("%.1fM", count / 1000000)
+  end
+  return tostring(math.floor((count / 1000000) + 0.5)) .. "M"
+end
+
+local function context_usage_label()
+  local usage = state.context_usage
+  if type(usage) ~= "table" then
+    return nil
+  end
+
+  local context_window = tonumber(usage.contextWindow)
+  if not context_window or context_window <= 0 then
+    return nil
+  end
+
+  local percent = tonumber(usage.percent)
+  local percent_label = percent and string.format("%.1f%%", percent) or "?"
+  local label = "ctx " .. percent_label .. "/" .. format_tokens(context_window)
+  if state.auto_compaction_enabled == true then
+    label = label .. " auto"
+  elseif state.auto_compaction_enabled == false then
+    label = label .. " no-auto"
+  end
+  return label
+end
 
 local function update_status()
   local parts = {}
@@ -39,11 +102,17 @@ local function update_status()
   if state.thinking_level then
     parts[#parts + 1] = tostring(state.thinking_level)
   end
+  local context_label = context_usage_label()
+  if context_label then
+    parts[#parts + 1] = context_label
+  end
   local frame = spinner_frames[state.spinner_index] or "⠋"
   if state.status_mode == "streaming" then
     parts[#parts + 1] = "thinking " .. frame
   elseif state.status_mode == "tool" and state.tool_name then
     parts[#parts + 1] = tostring(state.tool_name) .. " " .. frame
+  elseif state.status_mode == "compacting" then
+    parts[#parts + 1] = "compacting " .. frame
   end
   Panel.set_status(table.concat(parts, " · "))
 end
@@ -128,6 +197,9 @@ local function handle_response(msg)
     local model = msg.data.model
     state.model_name = model_label(model) or state.model_name
     state.thinking_level = msg.data.thinkingLevel or state.thinking_level
+    if msg.data.autoCompactionEnabled ~= nil then
+      state.auto_compaction_enabled = msg.data.autoCompactionEnabled == true
+    end
     persist_state(msg.data)
     update_status()
     return
@@ -145,12 +217,16 @@ local function handle_response(msg)
     local model = data.model
     state.model_name = model_label(model) or state.model_name
     state.thinking_level = data.thinkingLevel or state.thinking_level
+    state.context_usage = nil
     persist_state(data)
     update_status()
+    M.refresh_session_stats()
     return
   end
 
   if msg.command == "set_model" then
+    state.context_usage = nil
+    update_status()
     M.refresh_state()
     return
   end
@@ -178,7 +254,12 @@ local function handle_extension_ui_request(msg)
     return
   end
 
-  if msg.method == "setWidget" or msg.method == "setTitle" then
+  if msg.method == "setWidget" then
+    Panel.set_extension_widget(msg.widgetKey or msg.key or "extension", msg.widgetLines, msg.widgetPlacement)
+    return
+  end
+
+  if msg.method == "setTitle" then
     return
   end
 
@@ -225,6 +306,7 @@ local function handle_event(msg)
   if msg.type == "agent_start" then
     state.streaming = true
     state.abort_sent = false
+    state.assistant_text_seen = false
     set_status_mode("streaming")
     return
   end
@@ -234,6 +316,28 @@ local function handle_event(msg)
     state.abort_sent = false
     set_status_mode("idle")
     Panel.assistant_end()
+    M.refresh_session_stats()
+    return
+  end
+
+  if msg.type == "compaction_start" then
+    set_status_mode("compacting")
+    Panel.system("compacting context (" .. tostring(msg.reason or "auto") .. ")")
+    return
+  end
+
+  if msg.type == "compaction_end" then
+    set_status_mode(state.streaming and "streaming" or "idle")
+    if msg.errorMessage then
+      append_error(msg.errorMessage)
+    elseif msg.aborted then
+      Panel.system("compaction aborted")
+    elseif type(msg.result) == "table" then
+      Panel.system("compaction complete (" .. format_tokens(msg.result.tokensBefore) .. " before)")
+    else
+      Panel.system("compaction skipped")
+    end
+    M.refresh_session_stats()
     return
   end
 
@@ -242,10 +346,32 @@ local function handle_event(msg)
     return
   end
 
+  if msg.type == "message_start" then
+    if type(msg.message) == "table" and msg.message.role == "assistant" then
+      state.assistant_text_seen = false
+    end
+    return
+  end
+
   if msg.type == "message_update" then
     local event = msg.assistantMessageEvent
     if event and event.type == "text_delta" then
+      state.assistant_text_seen = true
       Panel.assistant_delta(event.delta or "")
+    end
+    return
+  end
+
+  if msg.type == "message_end" then
+    local message = msg.message
+    if type(message) == "table" and message.role == "assistant" and not state.assistant_text_seen then
+      local text = message_content_text(message.content)
+      if vim.trim(text) ~= "" then
+        Panel.assistant_start()
+        Panel.append_text(text)
+        Panel.assistant_end()
+        state.assistant_text_seen = true
+      end
     end
     return
   end
@@ -321,6 +447,7 @@ function M.start(opts)
     return true
   end
 
+  state.on_lifecycle = opts.on_lifecycle
   local extension_path = plugin_root() .. "/pi-extension/nvim-tools.ts"
   local append_prompt = table.concat({
     "You are running inside Neovim via piovim.nvim.",
@@ -332,6 +459,8 @@ function M.start(opts)
 
   state.model_name = nil
   state.thinking_level = nil
+  state.context_usage = nil
+  state.auto_compaction_enabled = nil
   state.streaming = false
   state.abort_sent = false
   set_status_mode("idle")
@@ -390,13 +519,22 @@ function M.start(opts)
         end)
       end
     end,
-    on_exit = function(_, code)
+    on_exit = function(job_id, code)
       vim.schedule(function()
+        if state.job ~= job_id then
+          return
+        end
         state.job = nil
         state.streaming = false
         state.abort_sent = false
+        state.context_usage = nil
+        state.auto_compaction_enabled = nil
+        state.callbacks = {}
         set_status_mode("idle")
         Panel.system("Pi process exited (" .. tostring(code) .. ")")
+        if state.on_lifecycle then
+          state.on_lifecycle("exited", code)
+        end
       end)
     end,
   })
@@ -422,9 +560,13 @@ function M.stop()
   state.job = nil
   state.streaming = false
   state.abort_sent = false
+  state.callbacks = {}
   set_status_mode("idle")
   vim.fn.jobstop(job)
   Panel.system("Pi stopped")
+  if state.on_lifecycle then
+    state.on_lifecycle("stopped")
+  end
 end
 
 function M.send(command, callback)
@@ -456,9 +598,30 @@ function M.prompt(message)
   return M.send(command)
 end
 
+function M.refresh_session_stats()
+  if not state.job then
+    return false
+  end
+
+  return M.send({ type = "get_session_stats" }, function(msg)
+    if not msg.success then
+      return
+    end
+
+    local usage = (msg.data or {}).contextUsage
+    if type(usage) == "table" then
+      state.context_usage = usage
+    else
+      state.context_usage = nil
+    end
+    update_status()
+  end)
+end
+
 function M.refresh_state()
   if state.job then
     M.send({ type = "get_state" })
+    M.refresh_session_stats()
   end
 end
 
@@ -474,6 +637,27 @@ function M.refresh_messages()
     end
     local messages = (msg.data or {}).messages or {}
     Panel.replace_messages(messages)
+  end)
+end
+
+function M.get_commands(callback)
+  if not state.job then
+    return false
+  end
+
+  return M.send({ type = "get_commands" }, function(msg)
+    if not msg.success then
+      append_error(msg.error or "Failed to get Pi commands")
+      if callback then
+        callback(nil, msg)
+      end
+      return
+    end
+
+    local commands = (msg.data or {}).commands or {}
+    if callback then
+      callback(commands, msg)
+    end
   end)
 end
 
@@ -502,6 +686,8 @@ function M.new_session(callback)
       return
     end
 
+    state.context_usage = nil
+    update_status()
     M.refresh_state()
     if callback then
       callback(true)

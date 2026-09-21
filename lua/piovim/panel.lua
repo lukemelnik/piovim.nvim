@@ -5,12 +5,16 @@ local M = {}
 local state = {
   history_buf = nil,
   history_win = nil,
+  widget_bufs = {},
+  widget_wins = {},
   prompt_buf = nil,
   prompt_win = nil,
   active_assistant = false,
   on_submit = nil,
   slash_commands = {},
   status = "",
+  widgets = {},
+  header_line_count = 0,
 }
 
 local ns = vim.api.nvim_create_namespace("piovim")
@@ -121,6 +125,74 @@ local function start_markdown_highlighter(buf)
   pcall(vim.treesitter.start, buf, "markdown")
 end
 
+local function sorted_widget_keys()
+  local keys = {}
+  for key, widget in pairs(state.widgets or {}) do
+    if type(widget) == "table" and type(widget.lines) == "table" and #widget.lines > 0 then
+      keys[#keys + 1] = key
+    end
+  end
+  table.sort(keys)
+  return keys
+end
+
+local function widget_display_lines(placement)
+  local lines = {}
+  for _, key in ipairs(sorted_widget_keys()) do
+    local widget = state.widgets[key]
+    if widget.placement == placement then
+      if #lines > 0 then lines[#lines + 1] = "" end
+      for _, line in ipairs(widget.lines) do lines[#lines + 1] = tostring(line) end
+    end
+  end
+  return lines
+end
+
+local function widget_window_height(placement)
+  local line_count = #widget_display_lines(placement)
+  return line_count == 0 and 0 or math.min(10, line_count)
+end
+
+local function render_header_lines()
+  return {
+    "πovim",
+    "Ask with <leader>pq, append context with <leader>pa, or type below.",
+    "",
+  }
+end
+
+local function highlight_header(buf, lines)
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, #lines)
+  vim.api.nvim_buf_add_highlight(buf, ns, "PiovimTitle", 0, 0, -1)
+  vim.api.nvim_buf_add_highlight(buf, ns, "PiovimMuted", 1, 0, -1)
+
+  local row = 3
+  while row < #lines do
+    local line = lines[row + 1] or ""
+    if line:sub(1, 2) == "◆ " then
+      vim.api.nvim_buf_add_highlight(buf, ns, "PiovimTool", row, 0, -1)
+    elseif line ~= "" then
+      vim.api.nvim_buf_add_highlight(buf, ns, "PiovimMuted", row, 0, -1)
+    end
+    row = row + 1
+  end
+end
+
+local function rerender_header()
+  if not valid_buf(state.history_buf) then
+    return
+  end
+
+  local lines = render_header_lines()
+  local old_count = state.header_line_count > 0 and state.header_line_count or 3
+  set_modifiable(state.history_buf, true)
+  vim.api.nvim_buf_set_lines(state.history_buf, 0, old_count, false, lines)
+  set_modifiable(state.history_buf, false)
+  state.header_line_count = #lines
+  highlight_header(state.history_buf, lines)
+  highlight_patterns(state.history_buf, 0, lines)
+end
+
 local function protect_panel_windows()
   if protecting then
     return
@@ -131,6 +203,8 @@ local function protect_panel_windows()
   local moved_win = nil
   local checks = {
     { win = state.history_win, buf = state.history_buf },
+    { win = state.widget_wins.aboveEditor, buf = state.widget_bufs.aboveEditor },
+    { win = state.widget_wins.belowEditor, buf = state.widget_bufs.belowEditor },
     { win = state.prompt_win, buf = state.prompt_buf },
   }
 
@@ -183,13 +257,10 @@ local function ensure_history_buf()
   vim.bo[state.history_buf].filetype = "piovim-chat"
   start_markdown_highlighter(state.history_buf)
   vim.api.nvim_buf_set_name(state.history_buf, "piovim://history")
-  vim.api.nvim_buf_set_lines(state.history_buf, 0, -1, false, {
-    "πovim",
-    "Ask with <leader>pq, append context with <leader>pa, or type below.",
-    "",
-  })
-  vim.api.nvim_buf_add_highlight(state.history_buf, ns, "PiovimTitle", 0, 0, -1)
-  vim.api.nvim_buf_add_highlight(state.history_buf, ns, "PiovimMuted", 1, 0, -1)
+  local header = render_header_lines()
+  state.header_line_count = #header
+  vim.api.nvim_buf_set_lines(state.history_buf, 0, -1, false, header)
+  highlight_header(state.history_buf, header)
   vim.bo[state.history_buf].modifiable = false
 
   return state.history_buf
@@ -211,6 +282,21 @@ local function ensure_prompt_buf()
   vim.api.nvim_buf_set_lines(state.prompt_buf, 0, -1, false, { "" })
 
   return state.prompt_buf
+end
+
+local function ensure_widget_buf(placement)
+  if valid_buf(state.widget_bufs[placement]) then return state.widget_bufs[placement] end
+  setup_highlights()
+  local buf = vim.api.nvim_create_buf(false, true)
+  state.widget_bufs[placement] = buf
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "hide"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "piovim-widget"
+  vim.api.nvim_buf_set_name(buf, "piovim://widgets-" .. placement)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
+  vim.bo[buf].modifiable = false
+  return buf
 end
 
 local function scroll_to_bottom()
@@ -236,6 +322,10 @@ local function hide_completion_menu()
   end)
 end
 
+local function statusline_escape(text)
+  return tostring(text or ""):gsub("%%", "%%%%")
+end
+
 local function set_prompt_win_options(win)
   hide_completion_menu()
   vim.wo[win].wrap = true
@@ -245,8 +335,63 @@ local function set_prompt_win_options(win)
   vim.wo[win].signcolumn = "no"
   vim.wo[win].winfixwidth = true
   vim.wo[win].winfixheight = true
-  local suffix = state.status ~= "" and (" %#PiovimMuted#" .. state.status .. " %*") or ""
+  local status = statusline_escape(state.status)
+  local suffix = status ~= "" and (" %#PiovimMuted#" .. status .. " %*") or ""
   vim.wo[win].winbar = "%#PiovimPrompt# Ask π %*" .. suffix
+end
+
+local function set_widget_win_options(win)
+  vim.wo[win].wrap = false
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+  vim.wo[win].signcolumn = "no"
+  vim.wo[win].winfixwidth = true
+  vim.wo[win].winfixheight = true
+  vim.wo[win].foldenable = false
+  vim.wo[win].cursorline = false
+end
+
+local function render_widget_buffer(placement)
+  local buf = ensure_widget_buf(placement)
+  local lines = widget_display_lines(placement)
+  if #lines == 0 then lines = { "" } end
+  set_modifiable(buf, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  set_modifiable(buf, false)
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  vim.api.nvim_buf_add_highlight(buf, ns, "PiovimTool", 0, 0, -1)
+  for row = 1, #lines - 1 do vim.api.nvim_buf_add_highlight(buf, ns, "PiovimMuted", row, 0, -1) end
+  highlight_patterns(buf, 0, lines)
+end
+
+local function close_widget_window(placement)
+  if valid_win(state.widget_wins[placement]) then vim.api.nvim_win_close(state.widget_wins[placement], true) end
+  state.widget_wins[placement] = nil
+end
+
+local function sync_widget_window()
+  for _, placement in ipairs({ "aboveEditor", "belowEditor" }) do
+    local height = widget_window_height(placement)
+    if height == 0 then
+      close_widget_window(placement)
+    elseif valid_win(state.history_win) then
+      local buf = ensure_widget_buf(placement)
+      render_widget_buffer(placement)
+      if valid_win(state.widget_wins[placement]) then
+        pcall(vim.api.nvim_win_set_height, state.widget_wins[placement], height)
+      else
+        local focused = vim.api.nvim_get_current_win()
+        local anchor = placement == "aboveEditor" and state.history_win or state.prompt_win
+        vim.api.nvim_set_current_win(anchor)
+        vim.cmd((placement == "aboveEditor" and "belowright " or "belowright ") .. height .. "split")
+        state.widget_wins[placement] = vim.api.nvim_get_current_win()
+        vim.api.nvim_win_set_buf(state.widget_wins[placement], buf)
+        set_widget_win_options(state.widget_wins[placement])
+        pcall(vim.api.nvim_win_set_height, state.widget_wins[placement], height)
+        if valid_win(focused) then vim.api.nvim_set_current_win(focused) end
+      end
+    end
+  end
 end
 
 function M.open(opts)
@@ -256,6 +401,7 @@ function M.open(opts)
   local prompt_buf = ensure_prompt_buf()
 
   if valid_win(state.history_win) and valid_win(state.prompt_win) then
+    sync_widget_window()
     return state.history_win
   end
 
@@ -272,6 +418,7 @@ function M.open(opts)
   state.prompt_win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(state.prompt_win, prompt_buf)
   set_prompt_win_options(state.prompt_win)
+  sync_widget_window()
 
   if opts.focus_prompt ~= false and valid_win(state.prompt_win) then
     vim.api.nvim_set_current_win(state.prompt_win)
@@ -281,9 +428,6 @@ function M.open(opts)
   end
 
   scroll_to_bottom()
-  pcall(function()
-    require("piovim.review_diff").resize_if_open()
-  end)
   return state.history_win
 end
 
@@ -291,16 +435,13 @@ function M.close()
   if valid_win(state.prompt_win) then
     vim.api.nvim_win_close(state.prompt_win, true)
   end
+  close_widget_window("aboveEditor")
+  close_widget_window("belowEditor")
   if valid_win(state.history_win) then
     vim.api.nvim_win_close(state.history_win, true)
   end
   state.prompt_win = nil
   state.history_win = nil
-  vim.schedule(function()
-    pcall(function()
-      require("piovim.review_diff").resize_if_open()
-    end)
-  end)
 end
 
 function M.toggle(opts)
@@ -312,7 +453,7 @@ function M.toggle(opts)
 end
 
 function M.is_open()
-  return valid_win(state.history_win) or valid_win(state.prompt_win)
+  return valid_win(state.history_win) or valid_win(state.widget_wins.aboveEditor) or valid_win(state.widget_wins.belowEditor) or valid_win(state.prompt_win)
 end
 
 function M.buf()
@@ -354,12 +495,37 @@ function M.set_status(text)
   end
 end
 
+function M.set_extension_widget(key, lines, placement)
+  if not key or key == "" then
+    return
+  end
+
+  if type(lines) ~= "table" or #lines == 0 then
+    state.widgets[key] = nil
+  else
+    placement = placement == "belowEditor" and "belowEditor" or "aboveEditor"
+    state.widgets[key] = { lines = lines, placement = placement }
+  end
+
+  if valid_buf(state.history_buf) then
+    rerender_header()
+  end
+  sync_widget_window()
+end
+
 function M.set_on_submit(callback)
   state.on_submit = callback
 end
 
 function M.set_slash_commands(commands)
   state.slash_commands = commands or {}
+  if valid_buf(state.prompt_buf) and M.update_prompt_hints then
+    vim.schedule(function()
+      if valid_buf(state.prompt_buf) then
+        M.update_prompt_hints()
+      end
+    end)
+  end
 end
 
 local function matching_slash_commands(prefix)

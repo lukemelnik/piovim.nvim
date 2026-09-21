@@ -15,7 +15,7 @@ function M.is_plugin_buffer(buf)
   end
 
   local name = vim.api.nvim_buf_get_name(buf) or ""
-  if name:match("^piovim://") or name:match("^Pi Review") then
+  if name:match("^piovim://") then
     return true
   end
 

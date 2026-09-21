@@ -2,7 +2,6 @@ local Bridge = require("piovim.bridge")
 local Context = require("piovim.context")
 local Panel = require("piovim.panel")
 local Rpc = require("piovim.rpc")
-local ReviewDiff = require("piovim.review_diff")
 local SelfFix = require("piovim.self_fix")
 local version = require("piovim.version")
 
@@ -21,33 +20,88 @@ local config = {
     stop = "<leader>px",
     clear = "<leader>pc",
     clear_highlights = "<leader>pH",
+    auto_accept_edits = "<leader>pe",
     thinking_select = "<leader>pt",
     thinking_cycle = "<leader>pT",
     model_select = "<leader>pm",
     model_cycle = "<leader>pM",
-    diff = "<leader>pd",
-    close_diff = "<leader>pD",
-  },
-  review = {
-    default_base = nil,
-    watch_interval_ms = 1500,
-    large_line_threshold = 5000,
-    omit_line_threshold = 20000,
-    max_untracked_file_bytes = 512 * 1024,
   },
   dev = {
     self_fix = false,
   },
 }
 
+local local_slash_commands = {}
+local remote_slash_commands = {}
+local slash_commands = {}
+local commands_loaded = false
+local commands_refresh_in_flight = false
+local refresh_remote_slash_commands
+
+local function normalize_slash_name(name)
+  if type(name) ~= "string" or name == "" then
+    return nil
+  end
+  if name:sub(1, 1) == "/" then
+    return name
+  end
+  return "/" .. name
+end
+
+local function merge_slash_commands()
+  local merged = {}
+  local seen = {}
+
+  local function add(command)
+    if type(command) ~= "table" then
+      return
+    end
+    local name = normalize_slash_name(command.name)
+    if not name or seen[name] then
+      return
+    end
+    seen[name] = true
+    merged[#merged + 1] = vim.tbl_extend("force", command, { name = name })
+  end
+
+  for _, command in ipairs(local_slash_commands) do
+    add(command)
+  end
+  for _, command in ipairs(remote_slash_commands) do
+    add(command)
+  end
+
+  slash_commands = merged
+  Panel.set_slash_commands(slash_commands)
+end
 
 local function ensure_started()
   local port, token = Bridge.start()
   Panel.open({ width = config.side_width, focus_prompt = false })
   if Rpc.is_running() then
+    if refresh_remote_slash_commands then
+      refresh_remote_slash_commands()
+    end
     return true
   end
-  return Rpc.start({ bin = config.bin, bridge_port = port, bridge_token = token })
+
+  local started = Rpc.start({
+    bin = config.bin,
+    bridge_port = port,
+    bridge_token = token,
+    on_lifecycle = function(event)
+      if event == "stopped" or event == "exited" then
+        commands_refresh_in_flight = false
+        commands_loaded = false
+        remote_slash_commands = {}
+        merge_slash_commands()
+      end
+    end,
+  })
+  if started and refresh_remote_slash_commands then
+    refresh_remote_slash_commands(true)
+  end
+  return started
 end
 
 function M.ask(question, opts)
@@ -164,6 +218,19 @@ function M.clear_highlights()
   Bridge.clear_highlights()
 end
 
+function M.toggle_edit_auto_accept()
+  local enabled = vim.g.piovim_auto_accept_edits ~= true
+  vim.g.piovim_auto_accept_edits = enabled
+
+  if enabled then
+    vim.notify("Pi edit previews disabled for this session; edits will apply directly", vim.log.levels.INFO)
+  else
+    vim.notify("Pi edit previews enabled; edits will ask before applying", vim.log.levels.INFO)
+  end
+
+  return enabled
+end
+
 function M.abort()
   Rpc.abort()
 end
@@ -203,29 +270,65 @@ function M.tree()
   end
 end
 
-function M.apply_review_fixes()
-  if not ensure_started() then
-    return
+function M.refresh_commands()
+  if ensure_started() and refresh_remote_slash_commands then
+    refresh_remote_slash_commands(true)
   end
-  local message = ReviewDiff.summary()
-  Panel.user_message("/apply", "Active review diff notes")
-  Rpc.prompt(message)
 end
 
-local slash_commands = {}
 local configured_keymaps = {}
 
+refresh_remote_slash_commands = function(force)
+  if not Rpc.is_running() then
+    return false
+  end
+  if commands_refresh_in_flight then
+    return false
+  end
+  if commands_loaded and not force then
+    return false
+  end
+
+  commands_refresh_in_flight = true
+  local dispatched = Rpc.get_commands(function(commands)
+    commands_refresh_in_flight = false
+    if type(commands) ~= "table" then
+      return
+    end
+
+    local remote = {}
+    for _, command in ipairs(commands) do
+      local name = normalize_slash_name(command.name)
+      if name then
+        remote[#remote + 1] = {
+          name = name,
+          description = command.description or command.source or "",
+          source = command.source,
+          location = command.location,
+          path = command.path,
+        }
+      end
+    end
+
+    remote_slash_commands = remote
+    commands_loaded = true
+    merge_slash_commands()
+  end)
+  if not dispatched then
+    commands_refresh_in_flight = false
+  end
+  return dispatched
+end
+
 local function register_slash_commands()
-  slash_commands = {
-    { name = "/clear", description = "Clear Pi session", handler = M.clear },
-    { name = "/model", description = "Select model", handler = M.select_model },
-    { name = "/thinking", description = "Select thinking level", handler = M.select_thinking_level },
-    { name = "/tree", description = "Navigate Pi session tree", handler = M.tree },
-    { name = "/pi-fix", description = "Append Piovim self-fix context", handler = M.append_self_fix_context },
-    { name = "/diff", description = "Open review diff picker", handler = ReviewDiff.pick, accepts_args = true },
-    { name = "/apply", description = "Ask Pi to apply active review notes", handler = M.apply_review_fixes },
+  local_slash_commands = {
+    { name = "/clear", description = "Clear Pi session", source = "piovim", handler = M.clear },
+    { name = "/model", description = "Select model", source = "piovim", handler = M.select_model },
+    { name = "/thinking", description = "Select thinking level", source = "piovim", handler = M.select_thinking_level },
+    { name = "/tree", description = "Navigate Pi session tree", source = "piovim", handler = M.tree },
+    { name = "/pi-fix", description = "Append Piovim self-fix context", source = "piovim", handler = M.append_self_fix_context },
   }
-  Panel.set_slash_commands(slash_commands)
+  merge_slash_commands()
 end
 
 local function set_tmux_navigation_keymaps(buf)
@@ -270,7 +373,11 @@ local function set_panel_keymaps(buf)
       Rpc.abort()
     end, { buffer = buf, desc = "Abort Pi turn" })
     vim.keymap.set("i", "<Tab>", function()
-      if Panel.complete_slash_command() then
+      local text = Panel.prompt_text()
+      if text:sub(1, 1) == "/" and not text:find("%s") then
+        vim.schedule(function()
+          Panel.complete_slash_command()
+        end)
         return ""
       end
       return vim.api.nvim_replace_termcodes("<Tab>", true, false, true)
@@ -298,6 +405,7 @@ local function setup_commands()
     print("piovim.nvim " .. M.version)
   end, { desc = "Print Piovim version" })
   command("PiovimClearHighlights", M.clear_highlights, { desc = "Clear Pi code highlights" })
+  command("PiovimToggleEditAutoAccept", M.toggle_edit_auto_accept, { desc = "Toggle direct application of Pi edit previews" })
   command("PiovimAppendContext", M.append_context, { desc = "Append current Pi context mention" })
   command("PiovimSelfFix", M.append_self_fix_context, { desc = "Append Piovim self-fix context" })
   command("PiovimAbort", M.abort, { desc = "Abort current Pi turn" })
@@ -306,7 +414,7 @@ local function setup_commands()
   command("PiovimModelSelect", M.select_model, { desc = "Select Pi model" })
   command("PiovimModelCycle", M.cycle_model, { desc = "Cycle Pi model" })
   command("PiovimTree", M.tree, { desc = "Navigate Pi session tree" })
-  ReviewDiff.setup_commands()
+  command("PiovimRefreshCommands", M.refresh_commands, { desc = "Refresh Pi slash command completion" })
 end
 
 local function set_keymap(modes, lhs, rhs, desc)
@@ -335,27 +443,28 @@ local function setup_keymaps()
   set_keymap("n", keys.stop, M.stop, "Piovim stop")
   set_keymap("n", keys.clear, M.clear, "Piovim clear")
   set_keymap("n", keys.clear_highlights, M.clear_highlights, "Pi clear highlights")
+  set_keymap("n", keys.auto_accept_edits, M.toggle_edit_auto_accept, "Pi toggle edit auto-accept")
   set_keymap("n", keys.thinking_cycle, M.cycle_thinking_level, "Pi thinking cycle")
   set_keymap("n", keys.thinking_select, M.select_thinking_level, "Pi thinking select")
   set_keymap("n", keys.model_select, M.select_model, "Pi model select")
   set_keymap("n", keys.model_cycle, M.cycle_model, "Pi model cycle")
-  set_keymap("n", keys.diff, ReviewDiff.pick, "Pi review diff")
-  set_keymap("n", keys.close_diff, ReviewDiff.close, "Pi close review diff")
 end
 
 local function handle_prompt_submit(text)
   if text:sub(1, 1) == "/" then
     local name, args = text:match("^(%S+)%s*(.*)$")
-    for _, command in ipairs(slash_commands) do
+    for _, command in ipairs(local_slash_commands) do
       if command.name == name then
-        if command.name == "/diff" and args ~= "" then
-          ReviewDiff.open(args)
-        else
-          command.handler(args)
-        end
+        command.handler(args)
         return
       end
     end
+
+    -- Let Pi handle extension commands, prompt templates, and skills. These
+    -- must be sent exactly as typed; adding Neovim context turns them into a
+    -- normal model prompt instead of a slash command.
+    M.ask(text, { context = "", context_summary = nil })
+    return
   end
   M.ask(text)
 end
@@ -363,7 +472,6 @@ end
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
   Context.setup({ snippet_context_lines = config.snippet_context_lines })
-  ReviewDiff.setup(config.review or {})
   Bridge.setup_autocmds()
   register_slash_commands()
   Panel.set_on_submit(handle_prompt_submit)

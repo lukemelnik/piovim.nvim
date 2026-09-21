@@ -6,7 +6,7 @@ VERSION_FILE := VERSION
 CURRENT_VERSION := $(shell tr -d '[:space:]' < $(VERSION_FILE) 2>/dev/null || echo 0.0.0)
 RELEASE_FLAGS ?=
 
-.PHONY: help check lint test smoke review-test version tag clean \
+.PHONY: help check lint test smoke version tag clean \
         release release\:patch release\:minor release\:major \
         _release_patch _release_minor _release_major
 
@@ -16,7 +16,6 @@ help: ## Show common repo commands
 	@echo "  make lint              Check Lua syntax"
 	@echo "  make test              Run headless Neovim tests"
 	@echo "  make smoke             Run smoke test only"
-	@echo "  make review-test       Run review diff tests only"
 	@echo "  make version           Print current plugin version"
 	@echo "  make release VERSION=0.1.0"
 	@echo "  make release:patch     Bump patch, check, commit version, and tag"
@@ -29,7 +28,7 @@ help: ## Show common repo commands
 	@echo "  RELEASE_FLAGS=--push-tag"
 
 lint: ## Check Lua syntax
-	luac -p lua/piovim/*.lua scripts/smoke.lua scripts/review_diff_tests.lua
+	luac -p lua/piovim/*.lua scripts/smoke.lua
 
 smoke: ## Run smoke test only
 	nvim --headless -u NONE \
@@ -37,13 +36,7 @@ smoke: ## Run smoke test only
 		-S scripts/smoke.lua \
 		-c qa
 
-review-test: ## Run review diff tests only
-	nvim --headless -u NONE \
-		-c 'lua vim.opt.rtp:prepend(vim.fn.getcwd())' \
-		-S scripts/review_diff_tests.lua \
-		-c qa
-
-test: smoke review-test ## Run headless Neovim tests
+test: smoke ## Run headless Neovim tests
 	nvim --headless -u NONE \
 		-c 'lua vim.opt.rtp:prepend(vim.fn.getcwd())' \
 		-c 'lua require("piovim").setup({ keys = {} })' \

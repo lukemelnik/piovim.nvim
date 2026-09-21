@@ -18,14 +18,6 @@ local function ok(message)
   end
 end
 
-local function warn(message, advice)
-  if vim.health and vim.health.warn then
-    vim.health.warn(message, advice)
-  else
-    vim.fn['health#report_warn'](message, advice or {})
-  end
-end
-
 local function error_report(message, advice)
   if vim.health and vim.health.error then
     vim.health.error(message, advice)
@@ -53,18 +45,6 @@ function M.check()
     ok("pi CLI found on PATH")
   else
     error_report("pi CLI not found on PATH", { "Install Pi and make sure `pi` is executable from Neovim's PATH." })
-  end
-
-  if vim.fn.executable("git") == 1 then
-    ok("git found on PATH")
-  else
-    error_report("git not found on PATH")
-  end
-
-  if vim.fn.executable("gh") == 1 then
-    ok("gh found on PATH for PR review sources")
-  else
-    warn("gh not found; GitHub PR review sources are unavailable", { "Install GitHub CLI to review GitHub PR diffs from Piovim." })
   end
 
   ok("No required Neovim plugin dependencies")

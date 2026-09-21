@@ -38,7 +38,32 @@ local function non_empty_lines(text)
   return lines
 end
 
-local function confirm(anchor)
+local function key_name(key)
+  local ok, translated = pcall(vim.fn.keytrans, key)
+  if ok and translated and translated ~= "" then
+    return translated
+  end
+  return key
+end
+
+local function is_plain_key(key, value)
+  return #key == 1 and key:lower() == value
+end
+
+local function run_preview_normal(win, keys)
+  if not valid_win(win) then
+    return false
+  end
+
+  local termcodes = vim.api.nvim_replace_termcodes(keys, true, false, true)
+  local ok = pcall(vim.api.nvim_win_call, win, function()
+    vim.cmd("normal! " .. termcodes)
+    vim.cmd("redraw")
+  end)
+  return ok
+end
+
+local function confirm(anchor, target_win)
   local prompt_buf = vim.api.nvim_create_buf(false, true)
   vim.bo[prompt_buf].buftype = "nofile"
   vim.bo[prompt_buf].bufhidden = "wipe"
@@ -47,11 +72,12 @@ local function confirm(anchor)
     "Apply Pi edit preview?",
     "a / y / enter  apply",
     "q / n / esc / ctrl-c  cancel",
+    "scroll: j/k/arrows, ctrl-d/u/f/b/e/y, wheel",
   })
   vim.bo[prompt_buf].modifiable = false
 
-  local width = 38
-  local height = 3
+  local width = 48
+  local height = 4
   local win_opts
   if anchor and valid_win(anchor.win) then
     local row = math.min(anchor.row + 1, math.max(0, vim.api.nvim_win_get_height(anchor.win) - height - 1))
@@ -60,7 +86,7 @@ local function confirm(anchor)
       win = anchor.win,
       row = row,
       col = 0,
-      width = math.min(width, vim.api.nvim_win_get_width(anchor.win) - 2),
+      width = math.max(1, math.min(width, vim.api.nvim_win_get_width(anchor.win) - 2)),
       height = height,
       border = "rounded",
       title = " Pi edit ",
@@ -83,7 +109,25 @@ local function confirm(anchor)
   vim.api.nvim_buf_add_highlight(prompt_buf, ns, "Question", 0, 0, -1)
   vim.api.nvim_buf_add_highlight(prompt_buf, ns, "MoreMsg", 1, 0, -1)
   vim.api.nvim_buf_add_highlight(prompt_buf, ns, "WarningMsg", 2, 0, -1)
+  vim.api.nvim_buf_add_highlight(prompt_buf, ns, "Comment", 3, 0, -1)
   vim.cmd("redraw")
+
+  local scroll_keys = {
+    j = "j",
+    k = "k",
+    ["<Down>"] = "j",
+    ["<Up>"] = "k",
+    ["<C-D>"] = "<C-D>",
+    ["<C-U>"] = "<C-U>",
+    ["<C-F>"] = "<C-F>",
+    ["<C-B>"] = "<C-B>",
+    ["<C-E>"] = "<C-E>",
+    ["<C-Y>"] = "<C-Y>",
+    ["<PageDown>"] = "<C-F>",
+    ["<PageUp>"] = "<C-B>",
+    ["<ScrollWheelDown>"] = "<C-E>",
+    ["<ScrollWheelUp>"] = "<C-Y>",
+  }
 
   local function close_prompt()
     if valid_win(prompt_win) then
@@ -99,14 +143,23 @@ local function confirm(anchor)
       close_prompt()
       return false
     end
-    key = key:lower()
-    if key == "a" or key == "y" or key == "\r" or key == "\n" then
+
+    local translated = key_name(key)
+    if is_plain_key(key, "a") or is_plain_key(key, "y") or translated == "<CR>" or translated == "<NL>" then
       close_prompt()
       return true
     end
-    if key == "q" or key == "n" or key == "\027" or key == "\003" then
+    if is_plain_key(key, "q") or is_plain_key(key, "n") or translated == "<Esc>" or translated == "<C-C>" then
       close_prompt()
       return false
+    end
+
+    local scroll = scroll_keys[translated]
+    if not scroll and #key == 1 then
+      scroll = scroll_keys[key]
+    end
+    if scroll then
+      run_preview_normal(target_win or (anchor and anchor.win), scroll)
     end
   end
 end
@@ -171,7 +224,7 @@ function M.show(buf, previews)
     end
   end
 
-  local choice = confirm(anchor)
+  local choice = confirm(anchor, preview_win)
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   if valid_win(current_win) then
     vim.api.nvim_set_current_win(current_win)
