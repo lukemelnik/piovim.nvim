@@ -54,22 +54,20 @@ If `:checkhealth piovim` cannot find `pi`, launch Neovim from the same shell whe
 - **Live editor awareness** — Pi can inspect current/open Neovim buffers, including unsaved changes.
 - **Learning-oriented navigation** — Pi can open files, jump to lines, and highlight ranges while explaining code.
 - **Previewed buffer edits** — Pi can propose undoable in-place Neovim edits before anything is saved.
-- **Code review workflow** — Piovim includes a diff viewer with notes, quickfix export, and Pi-visible annotations.
 - **Session tree rewind** — `:PiovimTree` opens the current Pi session tree so tangents can be discarded from context.
+- **Context usage status** — The prompt winbar shows current context-window usage and whether Pi auto-compaction is enabled.
 - **Explicit tool boundary** — Pi uses `nvim_*` tools for live editor state and normal Pi tools for unopened files and disk state.
 
-Pi's full terminal agent workflow is still the better fit for large autonomous edits and repo-wide implementation. Piovim is for moments where Neovim should be the shared workspace: explaining the code under the cursor, reading unsaved buffers, highlighting ranges, previewing small edits, and reviewing diffs with annotations.
+Pi's full terminal agent workflow is still the better fit for large autonomous edits and repo-wide implementation. Piovim is for moments where Neovim should be the shared workspace: explaining the code under the cursor, reading unsaved buffers, highlighting ranges, and previewing small edits.
 
 ## Requirements
 
 - Neovim 0.10+.
 - Current [Pi](https://pi.dev) CLI installed as `pi` and authenticated.
-- `git` for review diffs and repository comparisons.
 - Lazy.nvim or another Neovim plugin manager that can install GitHub repos.
 
 Optional:
 
-- `gh` for GitHub PR review sources (`/diff pr`, `:PiovimReviewPR`).
 - [vim-tmux-navigator](https://github.com/christoomey/vim-tmux-navigator) for `<C-h/j/k/l>` navigation inside Piovim panels.
 
 There are no required Neovim plugin dependencies: no plenary.nvim, Telescope, nui.nvim, diffview.nvim, or Treesitter dependency.
@@ -95,12 +93,11 @@ require("piovim").setup({
     stop = "<leader>px",
     clear = "<leader>pc",
     clear_highlights = "<leader>pH",
+    auto_accept_edits = "<leader>pe",
     thinking_select = "<leader>pt",
     thinking_cycle = "<leader>pT",
     model_select = "<leader>pm",
     model_cycle = "<leader>pM",
-    diff = "<leader>pd",
-    close_diff = "<leader>pD",
   },
 })
 ```
@@ -119,19 +116,11 @@ require("piovim").setup({
     stop = "<leader>px",
     clear = "<leader>pc",
     clear_highlights = "<leader>pH",
+    auto_accept_edits = "<leader>pe",
     thinking_select = "<leader>pt",
     thinking_cycle = "<leader>pT",
     model_select = "<leader>pm",
     model_cycle = "<leader>pM",
-    diff = "<leader>pd",
-    close_diff = "<leader>pD",
-  },
-  review = {
-    default_base = nil,
-    watch_interval_ms = 1500,
-    large_line_threshold = 5000,
-    omit_line_threshold = 20000,
-    max_untracked_file_bytes = 512 * 1024,
   },
 })
 ```
@@ -156,8 +145,7 @@ Global keys:
 | `<leader>px` | Stop Pi and close the panel |
 | `<leader>pc` | Clear Pi session, chat, prompt, and highlights |
 | `<leader>pH` | Clear Pi highlights |
-| `<leader>pd` | Open review diff picker |
-| `<leader>pD` | Close review diff |
+| `<leader>pe` | Toggle direct application of Pi edit previews for this session |
 | `<leader>pt` | Select thinking level |
 | `<leader>pT` | Cycle thinking level |
 | `<leader>pm` | Select model |
@@ -190,12 +178,10 @@ Typed in the Piovim prompt:
 - `/model` opens model selection.
 - `/thinking` opens thinking-level selection.
 - `/tree` opens the Pi session tree picker.
-- `/diff` opens the Pi review-source picker.
-- `/diff <args>` opens a Pi review diff with custom `git diff` args, e.g. `/diff main...HEAD`.
-- `/diff pr` or `/diff pr 123` opens the current branch PR or a numbered GitHub PR via `gh`.
-- `/apply` asks Pi to fix active review notes and resolve them as it goes.
 
-In the Pi prompt buffer, type a slash prefix and press `<Tab>` to complete slash commands. Multiple matches open a picker.
+Piovim also asks the Pi RPC backend for extension commands, prompt templates, and skills, then includes them in slash completion. Unknown slash commands are forwarded to Pi exactly as typed.
+
+In the Pi prompt buffer, type a slash prefix and press `<Tab>` to complete slash commands. Multiple matches open a picker. Use `:PiovimRefreshCommands` to refresh completion after changing or reloading extensions.
 
 ## Context mentions
 
@@ -215,55 +201,17 @@ make this easier to follow
 
 Mentions are intentionally plain text. Piovim does not paste selected code into the prompt for mention mode; Pi can use the `nvim_*` tools to read live Neovim buffers when needed.
 
-## Review diff
+## Diff review workflow
 
-`:PiovimReviewDiff` opens a review-source picker:
+Piovim does not own a diff review UI. Use a dedicated Neovim diff plugin such as `diffview.nvim` for branch, worktree, staged, commit, and file-history review. Piovim focuses on exposing stable live-buffer tools to Pi.
 
-- working tree (`git diff`, including untracked files)
-- staged changes (`git diff --cached`)
-- current branch vs default base (`<base>...HEAD`)
-- GitHub PR review via `gh pr diff`
-- last N commits
-- recent commit picker (`git show <sha>`)
-- commit range or picked base/head refs (`git diff <range>`)
-- patch file (`*.patch` / unified diff text)
-- custom `git diff` args
+A useful Diffview command for branch review is:
 
-While a review is open, Piovim watches the active review source and refreshes when Git or patch-file contents change. Refreshes are deferred while a review note is being typed or edited so annotations are not interrupted.
+```vim
+:DiffviewOpen origin/main...HEAD --imply-local
+```
 
-Large files are guarded during rendering: files over 5,000 rendered lines are marked as large, and sides over 20,000 rendered lines are omitted with a placeholder instead of filling Neovim with huge buffers.
-
-The diff panes label their sources, such as `OLD · index` and `NEW · worktree`. Alignment filler is rendered blank, while real added blank lines show a faint `+` marker.
-
-Press `?` in a review diff window to show the shortcut list.
-
-Inside the diff view:
-
-| Key | Action |
-| --- | --- |
-| `]f` / `[f` | Next / previous file |
-| `f` | Pick file with preview |
-| `b` | Toggle the file-list pane |
-| `]h` / `[h` | Next / previous hunk |
-| `J` / `K` | Next / previous hunk fallback |
-| `a` | Comment on current diff line |
-| visual `a` | Comment on selected diff lines |
-| `]c` / `[c` | Next / previous review comment |
-| `C` / `X` | Next / previous review comment fallback |
-| `e` | Edit the current/nearest review comment |
-| `x` | Delete the current/nearest review comment |
-| `z` | Toggle compact/expanded review comments |
-| `c` | Browse review comments with context |
-| `s` | Change source/comparison |
-| `Q` | Open review comments in quickfix |
-| `r` | Refresh current comparison |
-| `?` | Show review diff shortcuts |
-
-`:PiovimReviewNotes` opens a review-comment browser with context. `Q` still sends comments to the quickfix list.
-
-Custom diff args support simple shell-like quoting for paths with spaces, e.g. `/diff main...HEAD -- "docs/my file.md"`.
-
-Review annotations are persisted outside the repo at `stdpath("state")/piovim/reviews/` and old review state files are pruned after 30 days. Comments are anchored by file, line, selected text, and nearby context; refresh attempts to re-anchor notes when edits move code.
+The `--imply-local` flag shows the worktree version on the right side, so Piovim's generic `nvim_*` tools can inspect the same live buffers you are reviewing.
 
 ## Neovim tools
 
@@ -279,16 +227,10 @@ Piovim exposes explicit Pi tools for live editor state:
 - `nvim_edit_buffer`
 - `nvim_save_buffer`
 - `nvim_close_buffer`
-- `nvim_get_review_diff`
-- `nvim_add_review_annotation`
-- `nvim_refresh_review_diff`
-- `nvim_resolve_review_annotation`
 
 `nvim_edit_buffer` shows an in-place diff preview before applying unsaved, undoable Neovim buffer edits. It supports both exact replacements and explicit range edits for insertions/empty buffers.
 
 `nvim_save_buffer` saves file-backed buffers. `nvim_close_buffer` only closes unmodified buffers and refuses to discard unsaved changes.
-
-`nvim_get_review_diff` exposes the active Pi review diff state to Pi, including the selected comparison, file list, current hunk, and annotations. `nvim_add_review_annotation` lets Pi add actionable notes to the active review diff.
 
 ## Commands
 
@@ -300,24 +242,14 @@ Piovim exposes explicit Pi tools for live editor state:
 - `:PiovimClear`
 - `:PiovimVersion`
 - `:PiovimClearHighlights`
+- `:PiovimToggleEditAutoAccept`
 - `:PiovimAbort`
 - `:PiovimThinkingSelect`
 - `:PiovimThinkingCycle`
 - `:PiovimModelSelect`
 - `:PiovimModelCycle`
 - `:PiovimTree`
-- `:PiovimReviewDiff [working-tree|staged|main|origin/main|<git diff args>]`
-- `:PiovimReviewCommit [rev]`
-- `:PiovimReviewRange [range]`
-- `:PiovimReviewPatch [patch-file]`
-- `:PiovimReviewPR [number]`
-- `:PiovimReviewFiles`
-- `:PiovimReviewToggleFiles`
-- `:PiovimReviewClose`
-- `:PiovimReviewRefresh`
-- `:PiovimReviewEditNote`
-- `:PiovimReviewDeleteNote`
-- `:PiovimReviewNotes`
+- `:PiovimRefreshCommands`
 
 ## How it works
 
@@ -330,10 +262,10 @@ Neovim buffer/UI state
 piovim.nvim TCP bridge ◀── Pi RPC process + pi-extension/nvim-tools.ts
         │
         ▼
-side-panel chat, edit previews, review annotations
+side-panel chat and edit previews
 ```
 
-The extension registers `nvim_*` tools. Those tools call back into Neovim through a local bridge using a per-session token, so Pi can read live buffers, inspect diagnostics, add highlights, preview edits, and work with the active review diff.
+The extension registers fixed `nvim_*` tools. Tools call back into Neovim through a local bridge using a per-session token, so Pi can read live buffers, inspect diagnostics, add highlights, and preview edits.
 
 ## Development
 
@@ -346,7 +278,6 @@ Code layout:
 - `lua/piovim/bridge.lua` owns the local TCP bridge between Pi and Neovim.
 - `lua/piovim/buffer_ops.lua` implements Neovim buffer tools.
 - `lua/piovim/edit_preview.lua` renders in-place edit previews.
-- `lua/piovim/review_diff.lua` renders Git diff review buffers, navigation, and annotations.
 - `pi-extension/nvim-tools.ts` registers Pi-side `nvim_*` tools.
 
 Run local checks:
@@ -358,10 +289,9 @@ make check
 Or run the underlying checks directly:
 
 ```sh
-luac -p lua/piovim/*.lua scripts/smoke.lua scripts/review_diff_tests.lua
+luac -p lua/piovim/*.lua scripts/smoke.lua
 nvim --headless -u NONE --cmd 'set rtp^=/path/to/piovim.nvim' -c 'lua require("piovim").setup({ keys = {} })' -c 'qa'
 nvim --headless -u NONE --cmd 'set rtp^=/path/to/piovim.nvim' -S scripts/smoke.lua -c 'qa'
-nvim --headless -u NONE --cmd 'set rtp^=/path/to/piovim.nvim' -S scripts/review_diff_tests.lua -c 'qa'
 ```
 
 ## Release tags
@@ -402,10 +332,6 @@ Users can pin a semver tag with Lazy.nvim:
   end,
 }
 ```
-
-## Inspiration
-
-Piovim's diff review flow is inspired by [diffview.nvim](https://github.com/sindrets/diffview.nvim): side-by-side review, file navigation, hunk movement, and a review-focused workspace. Piovim does not depend on diffview.nvim; it keeps the diff state inside Piovim so Pi can inspect the active comparison and add or resolve annotations through `nvim_*` tools.
 
 ## Status
 

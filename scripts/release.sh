@@ -72,7 +72,7 @@ write_version_files() {
 
 run_checks() {
 	local lua_files
-	lua_files=(lua/piovim/*.lua scripts/smoke.lua scripts/review_diff_tests.lua)
+	lua_files=(lua/piovim/*.lua scripts/smoke.lua)
 
 	run git diff --check
 	run luac -p "${lua_files[@]}"
@@ -83,10 +83,6 @@ run_checks() {
 	run nvim --headless -u NONE \
 		-c 'lua vim.opt.rtp:prepend(vim.fn.getcwd())' \
 		-S scripts/smoke.lua \
-		-c qa
-	run nvim --headless -u NONE \
-		-c 'lua vim.opt.rtp:prepend(vim.fn.getcwd())' \
-		-S scripts/review_diff_tests.lua \
 		-c qa
 }
 
