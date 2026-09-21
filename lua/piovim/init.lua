@@ -85,7 +85,19 @@ local function ensure_started()
     return true
   end
 
-  local started = Rpc.start({ bin = config.bin, bridge_port = port, bridge_token = token })
+  local started = Rpc.start({
+    bin = config.bin,
+    bridge_port = port,
+    bridge_token = token,
+    on_lifecycle = function(event)
+      if event == "stopped" or event == "exited" then
+        commands_refresh_in_flight = false
+        commands_loaded = false
+        remote_slash_commands = {}
+        merge_slash_commands()
+      end
+    end,
+  })
   if started and refresh_remote_slash_commands then
     refresh_remote_slash_commands(true)
   end
@@ -278,7 +290,7 @@ refresh_remote_slash_commands = function(force)
   end
 
   commands_refresh_in_flight = true
-  return Rpc.get_commands(function(commands)
+  local dispatched = Rpc.get_commands(function(commands)
     commands_refresh_in_flight = false
     if type(commands) ~= "table" then
       return
@@ -302,6 +314,10 @@ refresh_remote_slash_commands = function(force)
     commands_loaded = true
     merge_slash_commands()
   end)
+  if not dispatched then
+    commands_refresh_in_flight = false
+  end
+  return dispatched
 end
 
 local function register_slash_commands()

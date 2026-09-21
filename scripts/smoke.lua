@@ -30,13 +30,31 @@ end
 local prompt_win = vim.fn.win_findbuf(panel.prompt_buf())[1]
 assert_true(prompt_win ~= nil, "prompt window missing")
 assert_true(vim.api.nvim_win_get_height(prompt_win) == 3, "prompt window should start at fixed height")
-panel.set_extension_widget("example-widget", { "Example Widget", "────────────────", "first item" })
+panel.set_extension_widget("above-widget", { "Above Widget" }, "aboveEditor")
+panel.set_extension_widget("below-widget", { "Below Widget" }, "belowEditor")
 assert_true(vim.api.nvim_win_get_height(prompt_win) == 3, "widget must not resize prompt window")
 local widget_bufs = widget_buffers()
-assert_true(#widget_bufs == 1, "widget window was not shown")
-local widget_lines = vim.api.nvim_buf_get_lines(widget_bufs[1], 0, -1, false)
-assert_true(widget_lines[1] == "Example Widget", "widget injected an extension key header")
-panel.set_extension_widget("example-widget", nil)
+assert_true(#widget_bufs == 2, "mixed placement widgets were not shown")
+local above_win, below_win
+for _, win in ipairs(vim.api.nvim_list_wins()) do
+  local buf = vim.api.nvim_win_get_buf(win)
+  if vim.bo[buf].filetype == "piovim-widget" then
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    if lines[1] == "Above Widget" then above_win = win end
+    if lines[1] == "Below Widget" then below_win = win end
+  end
+end
+assert_true(above_win and below_win, "widget placement buffers missing")
+assert_true(vim.fn.win_id2tabwin(above_win)[2] < vim.fn.win_id2tabwin(prompt_win)[2], "above widget is not above prompt")
+assert_true(vim.fn.win_id2tabwin(below_win)[2] > vim.fn.win_id2tabwin(prompt_win)[2], "below widget is not below prompt")
+panel.set_extension_widget("above-widget", nil)
+assert_true(#widget_buffers() == 1, "clearing above widget removed the wrong windows")
+assert_true(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(below_win), 0, -1, false)[1] == "Below Widget", "below widget was not preserved")
+panel.close()
+panel.open({ width = 80, focus_prompt = false })
+assert_true(#widget_buffers() == 1, "reopening the panel did not restore the remaining widget")
+prompt_win = vim.fn.win_findbuf(panel.prompt_buf())[1]
+panel.set_extension_widget("below-widget", nil)
 assert_true(#widget_buffers() == 0, "cleared widget did not close widget window")
 assert_true(vim.api.nvim_win_get_height(prompt_win) == 3, "cleared widget changed prompt window height")
 panel.set_prompt_text("/thi")

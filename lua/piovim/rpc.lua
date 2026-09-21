@@ -21,6 +21,7 @@ local state = {
   spinner_timer = nil,
   spinner_index = 1,
   assistant_text_seen = false,
+  on_lifecycle = nil,
 }
 
 local function plugin_root()
@@ -254,7 +255,7 @@ local function handle_extension_ui_request(msg)
   end
 
   if msg.method == "setWidget" then
-    Panel.set_extension_widget(msg.widgetKey or msg.key or "extension", msg.widgetLines)
+    Panel.set_extension_widget(msg.widgetKey or msg.key or "extension", msg.widgetLines, msg.widgetPlacement)
     return
   end
 
@@ -446,6 +447,7 @@ function M.start(opts)
     return true
   end
 
+  state.on_lifecycle = opts.on_lifecycle
   local extension_path = plugin_root() .. "/pi-extension/nvim-tools.ts"
   local append_prompt = table.concat({
     "You are running inside Neovim via piovim.nvim.",
@@ -517,8 +519,11 @@ function M.start(opts)
         end)
       end
     end,
-    on_exit = function(_, code)
+    on_exit = function(job_id, code)
       vim.schedule(function()
+        if state.job ~= job_id then
+          return
+        end
         state.job = nil
         state.streaming = false
         state.abort_sent = false
@@ -526,6 +531,9 @@ function M.start(opts)
         state.auto_compaction_enabled = nil
         set_status_mode("idle")
         Panel.system("Pi process exited (" .. tostring(code) .. ")")
+        if state.on_lifecycle then
+          state.on_lifecycle("exited", code)
+        end
       end)
     end,
   })
@@ -554,6 +562,9 @@ function M.stop()
   set_status_mode("idle")
   vim.fn.jobstop(job)
   Panel.system("Pi stopped")
+  if state.on_lifecycle then
+    state.on_lifecycle("stopped")
+  end
 end
 
 function M.send(command, callback)
