@@ -529,6 +529,7 @@ function M.start(opts)
         state.abort_sent = false
         state.context_usage = nil
         state.auto_compaction_enabled = nil
+        state.callbacks = {}
         set_status_mode("idle")
         Panel.system("Pi process exited (" .. tostring(code) .. ")")
         if state.on_lifecycle then
@@ -559,6 +560,7 @@ function M.stop()
   state.job = nil
   state.streaming = false
   state.abort_sent = false
+  state.callbacks = {}
   set_status_mode("idle")
   vim.fn.jobstop(job)
   Panel.system("Pi stopped")
